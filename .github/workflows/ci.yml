@@ -121,3 +121,27 @@ jobs:
         working-directory: .
         env:
           VITE_API_URL: ""
+
+  # ─────────────────────────────────────────────────────────────
+  # Helm: lint and render, including the appVersion image fallback
+  # ─────────────────────────────────────────────────────────────
+  helm:
+    name: Helm chart
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Lint chart
+        run: helm lint helm/snorlx
+
+      - name: Render chart
+        run: |
+          app_version=$(awk '/^appVersion:/ { gsub(/"/, "", $2); print $2 }' helm/snorlx/Chart.yaml)
+          helm template snorlx helm/snorlx > /tmp/snorlx.yaml
+          grep -q "ghcr.io/banshee86vr/snorlx-backend:${app_version}" /tmp/snorlx.yaml
+          grep -q "ghcr.io/banshee86vr/snorlx-frontend:${app_version}" /tmp/snorlx.yaml
+          helm template snorlx helm/snorlx --set image.backend.tag=9.9.9 --set image.frontend.tag=9.9.9 > /tmp/snorlx-override.yaml
+          grep -q 'ghcr.io/banshee86vr/snorlx-backend:9.9.9' /tmp/snorlx-override.yaml
+          grep -q 'ghcr.io/banshee86vr/snorlx-frontend:9.9.9' /tmp/snorlx-override.yaml

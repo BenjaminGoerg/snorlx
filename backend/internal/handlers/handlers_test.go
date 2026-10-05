@@ -12,6 +12,7 @@ import (
 
 	"snorlx/backend/internal/config"
 	"snorlx/backend/internal/models"
+	"snorlx/backend/internal/version"
 
 	"github.com/go-chi/chi/v5"
 	gh "github.com/google/go-github/v92/github"
@@ -31,7 +32,7 @@ type mockStorage struct {
 	revokeApiTokenFunc    func(ctx context.Context, userID, tokenID int) error
 }
 
-func (m *mockStorage) Close() error { return nil }
+func (m *mockStorage) Close() error   { return nil }
 func (m *mockStorage) Migrate() error { return nil }
 func (m *mockStorage) ListOrganizations(ctx context.Context) ([]models.Organization, error) {
 	if m.listOrgsFunc != nil {
@@ -718,6 +719,35 @@ func TestFilterRepositories_SyncLimitBiggerThanRepos(t *testing.T) {
 	result := h.filterRepositories(repos)
 	if len(result) != 2 {
 		t.Errorf("expected all 2 repos when limit > total, got %d", len(result))
+	}
+}
+
+func TestHealth(t *testing.T) {
+	h := &Handler{}
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.Health(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+
+	var body struct {
+		Status  string `json:"status"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Status != "ok" {
+		t.Errorf("status = %q, want ok", body.Status)
+	}
+	if body.Version != version.Version {
+		t.Errorf("version = %q, want %q", body.Version, version.Version)
 	}
 }
 

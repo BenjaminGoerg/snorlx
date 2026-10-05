@@ -354,7 +354,7 @@ For real-time updates via webhooks, configure a webhook in your repository/organ
 
 ### Health Check
 
-- `GET /health` - Health check endpoint
+- `GET /health` - JSON `{"status":"ok","version":"<release>"}`. Probes use the HTTP status code.
 
 ### Authentication
 
@@ -476,7 +476,7 @@ For real-time updates via webhooks, configure a webhook in your repository/organ
 
 ## CI/CD
 
-The project includes two GitHub Actions workflows:
+The project includes three GitHub Actions workflows:
 
 ### CI (`ci.yml`)
 
@@ -484,6 +484,11 @@ Runs on push and pull requests to `main`:
 
 - **Backend**: Go vet, tests with race detector and coverage, binary build
 - **Frontend**: Lint, tests with coverage, production build
+- **Helm**: `helm lint` and `helm template`, including the chart `appVersion` image tag fallback
+
+### Release (`release.yml`)
+
+Runs on push to `main`. release-please opens or updates the release pull request, and publishes the release when that pull request merges. On publish it verifies the immutable release, builds the backend and frontend images, and pushes the Helm chart. See [Releases](#releases).
 
 ### Security (`security.yml`)
 
@@ -503,7 +508,7 @@ This application follows the [12-Factor methodology](https://12factor.net/):
 2. **Dependencies**: Explicitly declared in `go.mod` and `package.json`
 3. **Config**: Environment variables for all configuration
 4. **Backing services**: Database as attached resource via URL
-5. **Build, release, run**: Docker images with semantic versioning
+5. **Build, release, run**: Docker images tagged with the product version
 6. **Processes**: Stateless; sessions in storage
 7. **Port binding**: Self-contained HTTP server
 8. **Concurrency**: Horizontal scaling via replicas
@@ -511,6 +516,29 @@ This application follows the [12-Factor methodology](https://12factor.net/):
 10. **Dev/prod parity**: Docker Compose mirrors production
 11. **Logs**: JSON to stdout, collected by platform
 12. **Admin processes**: Migrations as part of startup
+
+## Releases
+
+Releases are cut by [release-please](https://github.com/googleapis/release-please) from Conventional Commits on `main`. It opens a release pull request that bumps the product version in the root, frontend, and MCP `package.json` files, `backend/internal/version/version.go`, `mcp/src/server.ts`, and `helm/snorlx/Chart.yaml`, and writes `CHANGELOG.md`. Merging that pull request publishes tag `vX.Y.Z` and one GitHub Release.
+
+The repository uses GitHub immutable releases. After publication the tag cannot be moved, deleted, or reused, and GitHub attaches a release attestation. Check it with `gh release verify vX.Y.Z`. A failed verify, image, or chart job can be re-run from Actions. A new run publishes the `vX.Y.Z` tag already on that commit, or the tag you pass to workflow_dispatch. A wrong release needs a new patch version.
+
+Images are published only for that version, for `linux/amd64` and `linux/arm64`:
+
+```bash
+docker pull ghcr.io/banshee86vr/snorlx-backend:X.Y.Z
+docker pull ghcr.io/banshee86vr/snorlx-frontend:X.Y.Z
+```
+
+The Helm chart is an OCI artifact. An empty image tag in the chart uses `appVersion`, which matches the image tag.
+
+```bash
+helm install snorlx oci://ghcr.io/banshee86vr/charts/snorlx --version X.Y.Z
+```
+
+release-please authenticates with a GitHub App. Create the app (Contents, Pull requests, and Issues write), install it on this repository, and store `RELEASE_PLEASE_APP_ID` and `RELEASE_PLEASE_APP_PRIVATE_KEY` as secrets. Enable immutable releases under Settings, General, Releases before the first release.
+
+Any Conventional Commit, including `chore(deps)`, opens or updates a patch release pull request. Merge it when you want to ship.
 
 ## MCP
 

@@ -18,6 +18,7 @@ import (
 	"snorlx/backend/internal/models"
 	"snorlx/backend/internal/scorer"
 	"snorlx/backend/internal/storage"
+	"snorlx/backend/internal/version"
 	"snorlx/backend/internal/websocket"
 
 	"github.com/go-chi/chi/v5"
@@ -73,6 +74,20 @@ var defaultScopes = []string{"read", "write"}
 func IsBearerAuth(ctx context.Context) bool {
 	method, _ := ctx.Value(authMethodContextKey).(string)
 	return method == authMethodBearer
+}
+
+// Health reports process liveness and the release version.
+// Probes use the HTTP status code. The body is JSON for clients.
+func (h *Handler) Health(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(struct {
+		Status  string `json:"status"`
+		Version string `json:"version"`
+	}{
+		Status:  "ok",
+		Version: version.Version,
+	})
 }
 
 // ===== Auth Handlers =====
@@ -1062,10 +1077,10 @@ func (h *Handler) SyncRepository(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":         "ok",
-		"workflows":      workflows,
-		"runs":           runs,
-		"score_updated":  scoreUpdated,
+		"status":        "ok",
+		"workflows":     workflows,
+		"runs":          runs,
+		"score_updated": scoreUpdated,
 	})
 }
 
@@ -1428,7 +1443,7 @@ func (h *Handler) GetJobLogs(w http.ResponseWriter, r *http.Request) {
 
 // WorkflowDefinition represents the parsed workflow YAML structure
 type WorkflowDefinition struct {
-	Name string                            `yaml:"name" json:"name"`
+	Name string                           `yaml:"name" json:"name"`
 	Jobs map[string]WorkflowJobDefinition `yaml:"jobs" json:"jobs"`
 }
 
@@ -1619,7 +1634,7 @@ func (h *Handler) GetRunWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 				// External reusable workflow: org/repo/.github/workflows/file.yml@ref
 				// or org/repo/path/to/workflow.yml@ref
 				isLocal = false
-				
+
 				// Parse the external workflow path
 				// Format: {owner}/{repo}/{path}@{ref} or {owner}/{repo}/.github/workflows/{filename}@{ref}
 				atIdx := strings.LastIndex(reusablePath, "@")
@@ -1629,7 +1644,7 @@ func (h *Handler) GetRunWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 				} else {
 					reusableRef = "main" // Default to main if no ref specified
 				}
-				
+
 				// Split the path: owner/repo/path/to/file.yml
 				pathParts := strings.SplitN(reusablePath, "/", 3)
 				if len(pathParts) >= 3 {
@@ -2019,16 +2034,16 @@ func (h *Handler) refreshRunsFromGitHub(ctx context.Context, runs []models.Workf
 
 func (h *Handler) convertWorkflowRun(run *gh.WorkflowRun, repo *gh.Repository) *models.WorkflowRun {
 	result := &models.WorkflowRun{
-		GitHubID:    run.GetID(),
-		RunNumber:   run.GetRunNumber(),
-		Name:        run.GetName(),
-		Status:      run.GetStatus(),
-		Event:       run.GetEvent(),
-		Branch:      run.GetHeadBranch(),
-		CommitSHA:   run.GetHeadSHA(),
-		ActorLogin:  run.GetActor().GetLogin(),
-		HTMLURL:     run.GetHTMLURL(),
-		StartedAt:   run.GetRunStartedAt().Time,
+		GitHubID:   run.GetID(),
+		RunNumber:  run.GetRunNumber(),
+		Name:       run.GetName(),
+		Status:     run.GetStatus(),
+		Event:      run.GetEvent(),
+		Branch:     run.GetHeadBranch(),
+		CommitSHA:  run.GetHeadSHA(),
+		ActorLogin: run.GetActor().GetLogin(),
+		HTMLURL:    run.GetHTMLURL(),
+		StartedAt:  run.GetRunStartedAt().Time,
 	}
 
 	if run.Conclusion != nil {

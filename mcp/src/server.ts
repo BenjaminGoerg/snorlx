@@ -20,10 +20,10 @@ function errorResult(err: unknown) {
 export function createSnorlxMcpServer(client: SnorlxApiClient): McpServer {
   const server = new McpServer({
     name: 'snorlx',
-    version: '1.0.0',
+    version: '1.0.0', // x-release-please-version
   });
 
-  server.tool('health', 'Check Snorlx backend health.', {}, async () => {
+  server.tool('health', 'Check Snorlx backend health. The response includes status and version.', {}, async () => {
     try {
       return textResult(await client.request('GET', '/health'));
     } catch (err) {

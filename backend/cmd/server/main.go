@@ -14,6 +14,7 @@ import (
 	"snorlx/backend/internal/handlers"
 	"snorlx/backend/internal/scorer"
 	"snorlx/backend/internal/storage"
+	"snorlx/backend/internal/version"
 	"snorlx/backend/internal/websocket"
 
 	"github.com/go-chi/chi/v5"
@@ -27,7 +28,7 @@ import (
 
 func main() {
 	// Load .env file if it exists (try current dir, then parent for monorepo setup)
-	_ = godotenv.Load()       // ./backend/.env
+	_ = godotenv.Load()          // ./backend/.env
 	_ = godotenv.Load("../.env") // ./.env (project root)
 
 	// Configure zerolog
@@ -43,7 +44,7 @@ func main() {
 		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 	}
 
-	log.Info().Msg("Starting Snorlx CI/CD Dashboard")
+	log.Info().Str("version", version.Version).Msg("Starting Snorlx CI/CD Dashboard")
 
 	// Load configuration
 	cfg, err := config.Load()
@@ -104,11 +105,8 @@ func main() {
 		MaxAge:           300,
 	}))
 
-	// Health check
-	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("OK"))
-	})
+	// Health check (status code for probes, JSON body for clients)
+	r.Get("/health", h.Health)
 
 	// WebSocket endpoint (separate from /api for proper proxy handling)
 	r.Get("/ws", h.WebSocketHandler)

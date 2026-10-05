@@ -1,0 +1,237 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish, such as v1.0.0. Leave empty to use release-please or the tag already on this commit.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # release-please: open the release PR, or tag and publish
+  # ─────────────────────────────────────────────────────────────
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      major: ${{ steps.release.outputs.major }}
+      minor: ${{ steps.release.outputs.minor }}
+      patch: ${{ steps.release.outputs.patch }}
+
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+  # ─────────────────────────────────────────────────────────────
+  # Resolve which tag to publish. A re-run does not recreate the
+  # release, so a tag already on this commit still publishes.
+  # ─────────────────────────────────────────────────────────────
+  resolve:
+    name: Resolve release tag
+    needs: release-please
+    if: always() && needs.release-please.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.resolve.outputs.publish }}
+      tag_name: ${{ steps.resolve.outputs.tag_name }}
+      version: ${{ steps.resolve.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Resolve tag
+        id: resolve
+        env:
+          RELEASE_CREATED: ${{ needs.release-please.outputs.release_created }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          MANUAL_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag=""
+          if [ "$RELEASE_CREATED" = "true" ]; then
+            tag="$RELEASE_TAG"
+          elif [ -n "$MANUAL_TAG" ]; then
+            tag="$MANUAL_TAG"
+          else
+            git fetch --force origin "+refs/tags/v*:refs/tags/v*"
+            tag="$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+          fi
+
+          if [ -z "$tag" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Refusing tag that is not a plain version: $tag" >&2
+            exit 1
+          fi
+
+          {
+            echo "publish=true"
+            echo "tag_name=$tag"
+            echo "version=${tag#v}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ─────────────────────────────────────────────────────────────
+  # Verify the release is immutable before any artifact is pushed.
+  # This job is separate so a failed check can be re-run without
+  # losing the tag release-please already created.
+  # ─────────────────────────────────────────────────────────────
+  verify:
+    name: Verify immutable release
+    needs: resolve
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+
+    steps:
+      - name: Verify immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if gh release verify "$TAG"; then
+              exit 0
+            fi
+            echo "Release attestation not ready (attempt ${attempt}); retrying"
+            sleep 5
+          done
+          exit 1
+
+  # ─────────────────────────────────────────────────────────────
+  # Images: exact version tag, linux/amd64 and linux/arm64
+  # ─────────────────────────────────────────────────────────────
+  images:
+    name: Image (${{ matrix.component }})
+    needs: [resolve, verify]
+    if: needs.verify.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: backend
+            image: ghcr.io/banshee86vr/snorlx-backend
+            context: backend
+            file: backend/Dockerfile
+            build_args: ""
+          - component: frontend
+            image: ghcr.io/banshee86vr/snorlx-frontend
+            context: .
+            file: frontend/Dockerfile
+            build_args: VITE_API_URL=
+
+    steps:
+      - name: Checkout release
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.tag_name }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ matrix.image }}
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.resolve.outputs.tag_name }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ matrix.build_args }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+      - name: Record image digest
+        run: echo "${{ matrix.image }}@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────────────────────
+  # Chart: OCI push, version tag only
+  # ─────────────────────────────────────────────────────────────
+  chart:
+    name: Helm chart
+    needs: [resolve, verify]
+    if: needs.verify.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout release
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.tag_name }}
+
+      - name: Lint chart
+        run: helm lint helm/snorlx
+
+      - name: Package and push chart
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GITHUB_TOKEN" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+          tgz=$(helm package helm/snorlx | awk '{print $NF}')
+          helm push "$tgz" oci://ghcr.io/banshee86vr/charts
+          echo "oci://ghcr.io/banshee86vr/charts/snorlx:${{ needs.resolve.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"

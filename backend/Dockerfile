@@ -1,5 +1,6 @@
-# Build stage: use a 1.27 image for availability; go.mod pins the patch for govulncheck
-FROM golang:1.27-alpine AS builder
+# Build stage: use a 1.27 image for availability; go.mod pins the patch for govulncheck.
+# BUILDPLATFORM keeps the Go compile native while buildx targets arm64.
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
 
 WORKDIR /app
 
@@ -13,8 +14,11 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build with hardening flags
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo \
+# Build with hardening flags. buildx sets TARGETOS and TARGETARCH per platform.
+# Defaults keep a plain docker build on linux/amd64 working when they are unset.
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -a -installsuffix cgo \
     -ldflags="-s -w" -o server ./cmd/server
 
 # Final stage (use 3.23 for CI image availability; 3.24 when zlib 1.3.2+ is needed)

@@ -4,6 +4,7 @@ import { Settings as SettingsIcon, Moon, Sun, Monitor, Shield, Database, Key, Co
 import { useTheme } from '../context/ThemeContext';
 import { cn } from '../lib/utils';
 import { tokensApi } from '../services/api';
+import { AboutCard } from '../components/settings/AboutCard';
 
 export function Settings() {
   const { theme, setTheme } = useTheme();
@@ -262,6 +263,8 @@ export function Settings() {
           </div>
         </div>
       </div>
+
+      <AboutCard />
     </div>
   );
 }

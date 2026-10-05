@@ -1,5 +1,6 @@
-# Build stage: use pnpm from repo root (build context must be repo root)
-FROM node:26-alpine AS builder
+# Build stage: use pnpm from repo root (build context must be repo root).
+# BUILDPLATFORM keeps the Node build native; the nginx stage stays per-arch.
+FROM --platform=$BUILDPLATFORM node:26-alpine AS builder
 
 WORKDIR /app
 
