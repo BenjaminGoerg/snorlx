@@ -136,7 +136,7 @@ jobs:
   # Images: exact version tag, linux/amd64 and linux/arm64
   # ─────────────────────────────────────────────────────────────
   images:
-    name: Image (${{ matrix.component }})
+    name: Publish image
     needs: [resolve, verify]
     if: needs.verify.result == 'success'
     runs-on: ubuntu-latest
@@ -146,6 +146,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        component: [backend, frontend]
         include:
           - component: backend
             image: ghcr.io/banshee86vr/snorlx-backend
