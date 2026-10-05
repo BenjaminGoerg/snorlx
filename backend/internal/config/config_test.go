@@ -213,6 +213,19 @@ func TestGetEnv_MissingKey(t *testing.T) {
 	}
 }
 
+func TestLoad_GitHubBaseURL(t *testing.T) {
+	t.Setenv("DEV_MODE", "true")
+	t.Setenv("GITHUB_BASE_URL", "https://github.example.com")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.GitHubBaseURL != "https://github.example.com" {
+		t.Errorf("GitHubBaseURL = %q", cfg.GitHubBaseURL)
+	}
+}
+
 func TestLoad_StorageMode_CaseInsensitive(t *testing.T) {
 	t.Setenv("DEV_MODE", "true")
 	t.Setenv("STORAGE_MODE", "DATABASE")

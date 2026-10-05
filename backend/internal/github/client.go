@@ -106,21 +106,31 @@ func retryWithBackoff[T any](ctx context.Context, operation string, fn func() (T
 	return result, lastErr
 }
 
+// enterpriseURLs are the GitHub Enterprise Server endpoints derived from GITHUB_BASE_URL.
+// origin is scheme://host[:port] with no path, so go-github can append /api/v3 and /api/uploads.
+type enterpriseURLs struct {
+	oauth  oauth2.Endpoint
+	origin string
+}
+
 // Client wraps the GitHub API client using OAuth App authentication
 type Client struct {
 	config      *config.Config
 	oauthConfig *oauth2.Config
+	enterprise  *enterpriseURLs
 }
 
 // NewClient creates a new GitHub OAuth client
 func NewClient(cfg *config.Config) (*Client, error) {
 	endpoint := ghOAuth.Endpoint
-	if cfg.GitHubBaseURL != "" {
-		enterpriseEndpoint, err := enterpriseOAuthEndpoint(cfg.GitHubBaseURL)
+	var enterprise *enterpriseURLs
+	if raw := strings.TrimSpace(cfg.GitHubBaseURL); raw != "" {
+		resolved, err := resolveEnterpriseBaseURL(raw)
 		if err != nil {
-			return nil, fmt.Errorf("invalid GITHUB_BASE_URL: %w", err)
+			return nil, err
 		}
-		endpoint = enterpriseEndpoint
+		endpoint = resolved.oauth
+		enterprise = &resolved
 	}
 
 	oauthConfig := &oauth2.Config{
@@ -133,24 +143,47 @@ func NewClient(cfg *config.Config) (*Client, error) {
 	return &Client{
 		config:      cfg,
 		oauthConfig: oauthConfig,
+		enterprise:  enterprise,
 	}, nil
 }
 
-// enterpriseOAuthEndpoint derives the login/oauth authorize and token URLs
-// for a GitHub Enterprise Server instance from its base URL.
-func enterpriseOAuthEndpoint(baseURL string) (oauth2.Endpoint, error) {
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		return oauth2.Endpoint{}, err
+// resolveEnterpriseBaseURL accepts the Enterprise Server origin
+// (https://hostname) or the REST prefix (https://hostname/api/v3).
+// OAuth stays on the origin. The API client also receives only the origin:
+// passing a URL that already ends in /api/v3 as the upload URL makes
+// go-github append another api/uploads segment.
+func resolveEnterpriseBaseURL(raw string) (enterpriseURLs, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return enterpriseURLs{}, fmt.Errorf("invalid GITHUB_BASE_URL: %q is not an absolute URL", raw)
 	}
-	if u.Scheme == "" || u.Host == "" {
-		return oauth2.Endpoint{}, fmt.Errorf("%q is not an absolute URL", baseURL)
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return enterpriseURLs{}, fmt.Errorf("invalid GITHUB_BASE_URL: scheme must be http or https")
 	}
-	root := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
+	if u.User != nil {
+		return enterpriseURLs{}, fmt.Errorf("invalid GITHUB_BASE_URL: must not include user info")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return enterpriseURLs{}, fmt.Errorf("invalid GITHUB_BASE_URL: must not include a query or fragment")
+	}
 
-	return oauth2.Endpoint{
-		AuthURL:  root + "/login/oauth/authorize",
-		TokenURL: root + "/login/oauth/access_token",
+	host := u.Hostname()
+	if strings.HasPrefix(host, "api.") || strings.Contains(host, ".api.") || strings.HasPrefix(host, "uploads.") {
+		return enterpriseURLs{}, fmt.Errorf("invalid GITHUB_BASE_URL: set the Enterprise Server hostname, not the API host")
+	}
+
+	path := strings.TrimSuffix(u.EscapedPath(), "/")
+	if path != "" && path != "/api/v3" {
+		return enterpriseURLs{}, fmt.Errorf("invalid GITHUB_BASE_URL: use https://hostname or https://hostname/api/v3")
+	}
+
+	origin := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
+	return enterpriseURLs{
+		oauth: oauth2.Endpoint{
+			AuthURL:  origin + "/login/oauth/authorize",
+			TokenURL: origin + "/login/oauth/access_token",
+		},
+		origin: origin,
 	}, nil
 }
 
@@ -170,8 +203,8 @@ func (c *Client) GetUserClient(ctx context.Context, token *oauth2.Token) *github
 	tc := oauth2.NewClient(ctx, ts)
 
 	opts := []github.ClientOptionsFunc{github.WithHTTPClient(tc)}
-	if c.config.GitHubBaseURL != "" {
-		opts = append(opts, github.WithEnterpriseURLs(c.config.GitHubBaseURL, c.config.GitHubBaseURL))
+	if c.enterprise != nil {
+		opts = append(opts, github.WithEnterpriseURLs(c.enterprise.origin, c.enterprise.origin))
 	}
 
 	client, err := github.NewClient(opts...)

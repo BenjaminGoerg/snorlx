@@ -14,6 +14,7 @@ import (
 	"snorlx/backend/internal/config"
 
 	ghLib "github.com/google/go-github/v90/github"
+	"golang.org/x/oauth2"
 )
 
 func newTestClient(webhookSecret string) *Client {
@@ -334,6 +335,124 @@ func TestGetAuthURL_ContainsClientID(t *testing.T) {
 	// The URL should contain the state parameter
 	if !contains(url, "state=random-state") {
 		t.Errorf("expected auth URL to contain state parameter, got: %s", url)
+	}
+}
+
+func TestNewClient_EnterpriseBaseURL(t *testing.T) {
+	cases := []struct {
+		name       string
+		baseURL    string
+		wantOrigin string
+		wantAuth   string
+	}{
+		{
+			name:       "host root",
+			baseURL:    "https://github.example.com",
+			wantOrigin: "https://github.example.com",
+			wantAuth:   "https://github.example.com/login/oauth/authorize",
+		},
+		{
+			name:       "trailing slash",
+			baseURL:    "https://github.example.com/",
+			wantOrigin: "https://github.example.com",
+			wantAuth:   "https://github.example.com/login/oauth/authorize",
+		},
+		{
+			name:       "api v3 prefix",
+			baseURL:    "https://github.example.com/api/v3/",
+			wantOrigin: "https://github.example.com",
+			wantAuth:   "https://github.example.com/login/oauth/authorize",
+		},
+		{
+			name:       "port and surrounding space",
+			baseURL:    "  http://github.example.com:8443/api/v3  ",
+			wantOrigin: "http://github.example.com:8443",
+			wantAuth:   "http://github.example.com:8443/login/oauth/authorize",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := NewClient(&config.Config{
+				GitHubClientID:     "test-id",
+				GitHubClientSecret: "test-secret",
+				GitHubBaseURL:      tc.baseURL,
+			})
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+			if client.enterprise == nil || client.enterprise.origin != tc.wantOrigin {
+				t.Fatalf("origin = %#v, want %s", client.enterprise, tc.wantOrigin)
+			}
+			authURL := client.GetAuthURL("state-1")
+			if !contains(authURL, tc.wantAuth) {
+				t.Errorf("auth URL %q does not contain %s", authURL, tc.wantAuth)
+			}
+
+			api := client.GetUserClient(context.Background(), &oauth2.Token{AccessToken: "token"})
+			if api == nil {
+				t.Fatal("expected GitHub API client")
+			}
+			if api.BaseURL() != tc.wantOrigin+"/api/v3/" {
+				t.Errorf("BaseURL = %s", api.BaseURL())
+			}
+			if api.UploadURL() != tc.wantOrigin+"/api/uploads/" {
+				t.Errorf("UploadURL = %s", api.UploadURL())
+			}
+		})
+	}
+}
+
+func TestGetUserClient_PublicGitHubURLs(t *testing.T) {
+	client := newTestClient("")
+	api := client.GetUserClient(context.Background(), &oauth2.Token{AccessToken: "token"})
+	if api == nil {
+		t.Fatal("expected GitHub API client")
+	}
+	if api.BaseURL() != "https://api.github.com/" {
+		t.Errorf("BaseURL = %s", api.BaseURL())
+	}
+	if api.UploadURL() != "https://uploads.github.com/" {
+		t.Errorf("UploadURL = %s", api.UploadURL())
+	}
+}
+
+func TestNewClient_RejectsBadEnterpriseURL(t *testing.T) {
+	cases := []string{
+		"github.example.com",
+		"ftp://github.example.com",
+		"https://user:pass@github.example.com",
+		"https://github.example.com/github",
+		"https://github.example.com?x=1",
+		"https://github.example.com#frag",
+		"https://api.github.com",
+		"https://uploads.github.example.com",
+	}
+	for _, baseURL := range cases {
+		t.Run(baseURL, func(t *testing.T) {
+			_, err := NewClient(&config.Config{
+				GitHubClientID:     "test-id",
+				GitHubClientSecret: "test-secret",
+				GitHubBaseURL:      baseURL,
+			})
+			if err == nil {
+				t.Fatal("expected invalid GITHUB_BASE_URL error")
+			}
+		})
+	}
+}
+
+func TestNewClient_BlankEnterpriseURLUsesGitHubCom(t *testing.T) {
+	client, err := NewClient(&config.Config{
+		GitHubClientID:     "test-id",
+		GitHubClientSecret: "test-secret",
+		GitHubBaseURL:      "   ",
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if client.enterprise != nil {
+		t.Fatal("whitespace GITHUB_BASE_URL should keep the public GitHub endpoints")
 	}
 }
 
