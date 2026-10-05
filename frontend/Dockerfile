@@ -1,12 +1,16 @@
 # Build stage: use pnpm from repo root (build context must be repo root)
 FROM node:26-alpine AS builder
 
-RUN npm install -g pnpm@11.10.0
-
 WORKDIR /app
 
+# Install the pnpm version declared in package.json. A global pnpm 11 install
+# tries to launch a newer packageManager build as a Node module and crashes
+# when that build is a native binary.
+COPY package.json ./
+RUN npm install -g "$(node -e 'process.stdout.write(require("./package.json").packageManager)')"
+
 # Copy workspace and frontend package files (when context is repo root: docker build -f frontend/Dockerfile .)
-COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
+COPY pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY frontend/package.json frontend/package.json
 
 # Install dependencies (workspace root)

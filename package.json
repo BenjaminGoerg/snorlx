@@ -27,10 +27,10 @@
     "mcp:http": "node mcp/dist/index.js --http"
   },
   "devDependencies": {
-    "concurrently": "^10.0.3"
+    "concurrently": "^10.0.5"
   },
   "engines": {
     "node": ">=20.0.0"
   },
-  "packageManager": "pnpm@12.4.1"
+  "packageManager": "pnpm@12.9.1"
 }
