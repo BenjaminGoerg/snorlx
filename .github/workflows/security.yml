@@ -9,6 +9,7 @@ on:
     # Run weekly on Monday at 08:00 UTC
     - cron: "0 8 * * 1"
 
+# Actions are pinned to full commit SHAs (tag in the trailing comment). Dependabot keeps them current.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -32,17 +33,17 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go (for CodeQL Go analysis)
         if: matrix.language == 'go'
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.31.11
         with:
           languages: ${{ matrix.language }}
           queries: security-and-quality
@@ -53,34 +54,30 @@ jobs:
 
       - name: Set up Node.js (for JS/TS analysis)
         if: matrix.language == 'javascript-typescript'
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
 
       - name: Set up pnpm (for JS/TS analysis)
         if: matrix.language == 'javascript-typescript'
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - name: Install dependencies (for JS/TS analysis)
         if: matrix.language == 'javascript-typescript'
-        run: |
-          pnpm install --frozen-lockfile || {
-            echo "Frozen install failed, regenerating lockfile for this CI run..."
-            rm -f pnpm-lock.yaml
-            pnpm install --no-frozen-lockfile
-          }
+        run: pnpm install --frozen-lockfile
 
       - name: Autobuild (for JS/TS)
         if: matrix.language == 'javascript-typescript'
-        uses: github/codeql-action/autobuild@v4
+        uses: github/codeql-action/autobuild@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.31.11
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.31.11
         with:
           category: /language:${{ matrix.language }}
 
   # ─────────────────────────────────────────────────────────────
-  # Trivy: vulnerability scanning for filesystems and containers
+  # Trivy: vulnerability scanning for filesystems and containers.
+  # Fixable CRITICAL/HIGH findings fail the job; results also go to code scanning.
   # ─────────────────────────────────────────────────────────────
   trivy-fs:
     name: Trivy Filesystem Scan
@@ -88,7 +85,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run Trivy on filesystem (Go + Node dependencies)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -98,11 +95,12 @@ jobs:
           format: sarif
           output: trivy-fs-results.sarif
           severity: CRITICAL,HIGH
-          exit-code: "0"
+          ignore-unfixed: true
+          exit-code: "1"
 
       - name: Upload Trivy filesystem scan results
-        if: success()
-        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.31.11
         with:
           sarif_file: trivy-fs-results.sarif
           category: trivy-filesystem
@@ -113,7 +111,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build backend Docker image
         run: docker build -t snorlx-backend:ci .
@@ -126,11 +124,12 @@ jobs:
           format: sarif
           output: trivy-backend-image.sarif
           severity: CRITICAL,HIGH
-          exit-code: "0"
+          ignore-unfixed: true
+          exit-code: "1"
 
       - name: Upload Trivy backend image scan results
-        if: success()
-        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.31.11
         with:
           sarif_file: trivy-backend-image.sarif
           category: trivy-backend-image
@@ -141,7 +140,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build frontend Docker image
         run: docker build -f frontend/Dockerfile -t snorlx-frontend:ci .
@@ -153,12 +152,12 @@ jobs:
           format: sarif
           output: trivy-frontend-image.sarif
           severity: CRITICAL,HIGH
-          exit-code: "0"
           ignore-unfixed: true
+          exit-code: "1"
 
       - name: Upload Trivy frontend image scan results
-        if: success()
-        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.31.11
         with:
           sarif_file: trivy-frontend-image.sarif
           category: trivy-frontend-image
@@ -173,15 +172,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Dependency Review
-        uses: actions/dependency-review-action@v5.0.0
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high
 
   # ─────────────────────────────────────────────────────────────
-  # Go security: govulncheck and gosec
+  # Go security: govulncheck and gosec (pinned versions)
   # ─────────────────────────────────────────────────────────────
   go-security:
     name: Go Security (govulncheck + gosec)
@@ -193,29 +192,29 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
 
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
 
       - name: Run govulncheck
         run: govulncheck ./...
 
       - name: Install gosec
-        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
 
       - name: Run gosec
         run: gosec -fmt sarif -out gosec-results.sarif ./...
 
       - name: Upload gosec results
         if: hashFiles('backend/gosec-results.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.31.11
         with:
           sarif_file: backend/gosec-results.sarif
           category: gosec
@@ -229,23 +228,18 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - name: Install dependencies
-        run: |
-          pnpm install --frozen-lockfile || {
-            echo "Frozen install failed, regenerating lockfile for this CI run..."
-            rm -f pnpm-lock.yaml
-            pnpm install --no-frozen-lockfile
-          }
+        run: pnpm install --frozen-lockfile
 
       - name: Run pnpm audit
         run: pnpm audit --audit-level=high

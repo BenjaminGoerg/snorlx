@@ -51,3 +51,15 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-patch"]
+
+  # GitHub Actions: keeps the SHA pins in the workflows current
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "ci"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-patch"]

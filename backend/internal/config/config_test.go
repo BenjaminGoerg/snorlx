@@ -238,3 +238,138 @@ func TestLoad_StorageMode_CaseInsensitive(t *testing.T) {
 		t.Errorf("expected database storage mode for uppercase input, got %q", cfg.StorageMode)
 	}
 }
+
+func setProdEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("DEV_MODE", "")
+	t.Setenv("GITHUB_CLIENT_ID", "some-id")
+	t.Setenv("GITHUB_CLIENT_SECRET", "some-secret")
+	t.Setenv("SESSION_SECRET", "secure-random-session-secret-value-long-enough")
+	t.Setenv("STORAGE_MODE", "memory")
+	t.Setenv("COOKIE_SECURE", "")
+	t.Setenv("TRUSTED_PROXY_CIDRS", "")
+}
+
+func TestLoad_ProductionMode_ShortSessionSecret(t *testing.T) {
+	setProdEnv(t)
+	t.Setenv("SESSION_SECRET", "too-short")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for short SESSION_SECRET in production")
+	}
+}
+
+func TestLoad_ProductionMode_DatabaseModeRequiresURL(t *testing.T) {
+	setProdEnv(t)
+	t.Setenv("STORAGE_MODE", "database")
+	t.Setenv("DATABASE_URL", "")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for database mode without DATABASE_URL")
+	}
+}
+
+func TestLoad_FrontendURL_NormalizedToOrigin(t *testing.T) {
+	t.Setenv("DEV_MODE", "true")
+	t.Setenv("FRONTEND_URL", "HTTPS://Dash.Example.com/")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.FrontendURL != "https://dash.example.com" {
+		t.Errorf("FrontendURL = %q, want normalized origin", cfg.FrontendURL)
+	}
+	if !cfg.CookieSecure {
+		t.Error("https frontend must default CookieSecure to true")
+	}
+}
+
+func TestLoad_FrontendURL_Invalid(t *testing.T) {
+	for _, raw := range []string{"not-a-url", "ftp://host", "https://host/app", "https://host?x=1", "https://user:pw@host"} {
+		t.Setenv("DEV_MODE", "true")
+		t.Setenv("FRONTEND_URL", raw)
+		if _, err := Load(); err == nil {
+			t.Errorf("expected error for FRONTEND_URL %q", raw)
+		}
+	}
+}
+
+func TestLoad_ProductionMode_RejectsPlainHTTPOnPublicHost(t *testing.T) {
+	setProdEnv(t)
+	t.Setenv("FRONTEND_URL", "http://dashboard.example.com")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for http FRONTEND_URL on a public host in production")
+	}
+
+	t.Setenv("FRONTEND_URL", "http://localhost:5174")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("loopback http must be accepted: %v", err)
+	}
+	if cfg.CookieSecure {
+		t.Error("http frontend must default CookieSecure to false")
+	}
+}
+
+func TestLoad_CookieSecureOverride(t *testing.T) {
+	t.Setenv("DEV_MODE", "true")
+	t.Setenv("FRONTEND_URL", "http://localhost:5173")
+	t.Setenv("COOKIE_SECURE", "true")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.CookieSecure {
+		t.Error("COOKIE_SECURE=true must force the Secure flag")
+	}
+
+	t.Setenv("COOKIE_SECURE", "maybe")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for non-boolean COOKIE_SECURE")
+	}
+}
+
+func TestLoad_TrustedProxyCIDRs(t *testing.T) {
+	t.Setenv("DEV_MODE", "true")
+	t.Setenv("COOKIE_SECURE", "")
+	t.Setenv("TRUSTED_PROXY_CIDRS", "10.0.0.0/8, 192.168.1.5, fd00::/8")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.TrustedProxyCIDRs) != 3 {
+		t.Fatalf("expected 3 networks, got %d", len(cfg.TrustedProxyCIDRs))
+	}
+	if ones, _ := cfg.TrustedProxyCIDRs[1].Mask.Size(); ones != 32 {
+		t.Errorf("bare IPv4 must become /32, got /%d", ones)
+	}
+
+	t.Setenv("TRUSTED_PROXY_CIDRS", "nonsense")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for invalid TRUSTED_PROXY_CIDRS")
+	}
+}
+
+func TestLoad_LoginAllowlist(t *testing.T) {
+	t.Setenv("DEV_MODE", "true")
+	t.Setenv("TRUSTED_PROXY_CIDRS", "")
+	t.Setenv("ALLOWED_GITHUB_USERS", "")
+	t.Setenv("ALLOWED_GITHUB_ORGS", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.LoginRestricted() {
+		t.Error("no allowlist must not restrict login")
+	}
+
+	t.Setenv("ALLOWED_GITHUB_ORGS", "acme, ")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.LoginRestricted() || len(cfg.AllowedGitHubOrgs) != 1 || cfg.AllowedGitHubOrgs[0] != "acme" {
+		t.Errorf("unexpected allowlist: %v", cfg.AllowedGitHubOrgs)
+	}
+}

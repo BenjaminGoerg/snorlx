@@ -20,6 +20,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "snorlx.serviceAccountName" . }}
+      automountServiceAccountToken: false
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -28,10 +29,21 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.frontend.repository }}:{{ .Values.image.frontend.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.frontend.pullPolicy }}
+          env:
+            # nginx proxies /api and /ws to the backend so the browser talks to one origin
+            - name: BACKEND_UPSTREAM
+              value: {{ include "snorlx.backendUpstream" . | quote }}
           ports:
             - name: http
               containerPort: {{ .Values.frontend.port }}
               protocol: TCP
+          # The image entrypoint renders the nginx template into conf.d and nginx-unprivileged
+          # keeps its pid and temp files under /tmp; both need to be writable with a read-only root.
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+            - name: tmp
+              mountPath: /tmp
           livenessProbe:
             httpGet:
               path: /health
@@ -46,6 +58,11 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.frontend.resources | nindent 12 }}
+      volumes:
+        - name: nginx-conf
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.frontend.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -58,4 +75,3 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-

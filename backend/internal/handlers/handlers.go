@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -76,6 +78,115 @@ func IsBearerAuth(ctx context.Context) bool {
 	return method == authMethodBearer
 }
 
+const (
+	oauthStateCookieName = "oauth_state"
+	// sessionCookieSecureName uses the __Host- prefix: browsers only accept it over HTTPS, with
+	// Path=/ and without Domain, so a subdomain or plain-http attacker cannot plant it.
+	sessionCookieSecureName   = "__Host-session"
+	sessionCookieInsecureName = "session"
+)
+
+// sessionCookieName returns the cookie name that matches the configured Secure flag.
+func (h *Handler) sessionCookieName() string {
+	if h.config.CookieSecure {
+		return sessionCookieSecureName
+	}
+	return sessionCookieInsecureName
+}
+
+// readSessionCookie returns the session cookie value, accepting only the name that matches the
+// current security mode.
+func (h *Handler) readSessionCookie(r *http.Request) (string, bool) {
+	cookie, err := r.Cookie(h.sessionCookieName())
+	if err != nil || cookie.Value == "" {
+		return "", false
+	}
+	return cookie.Value, true
+}
+
+func (h *Handler) authCookie(name, value string, maxAge int, expires time.Time) *http.Cookie {
+	cookie := &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   h.config.CookieSecure,
+		SameSite: http.SameSiteLaxMode,
+	}
+	if maxAge != 0 {
+		cookie.MaxAge = maxAge
+	}
+	if !expires.IsZero() {
+		cookie.Expires = expires
+	}
+	return cookie
+}
+
+// requireRepoAccess writes a 404 and returns false when user may not see repoID. The response is
+// identical to a missing resource so callers cannot enumerate other users' repositories.
+func (h *Handler) requireRepoAccess(w http.ResponseWriter, r *http.Request, user *models.User, repoID int) bool {
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	allowed, err := h.storage.HasRepositoryAccess(r.Context(), user.ID, repoID)
+	if err != nil {
+		log.Error().Err(err).Int("user_id", user.ID).Int("repo_id", repoID).Msg("Failed to check repository access")
+		http.Error(w, "Not found", http.StatusNotFound)
+		return false
+	}
+	if !allowed {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return false
+	}
+	return true
+}
+
+// loadAccessibleRun fetches a run and verifies the user may see its repository.
+func (h *Handler) loadAccessibleRun(w http.ResponseWriter, r *http.Request, user *models.User, runID int) (*models.WorkflowRun, bool) {
+	run, err := h.storage.GetRun(r.Context(), runID)
+	if err != nil {
+		http.Error(w, "Run not found", http.StatusNotFound)
+		return nil, false
+	}
+	if !h.requireRepoAccess(w, r, user, run.RepoID) {
+		return nil, false
+	}
+	return run, true
+}
+
+// loadAccessibleRepo fetches a repository and verifies the user may see it.
+func (h *Handler) loadAccessibleRepo(w http.ResponseWriter, r *http.Request, user *models.User, repoID int) (*models.Repository, bool) {
+	if !h.requireRepoAccess(w, r, user, repoID) {
+		return nil, false
+	}
+	repo, err := h.storage.GetRepository(r.Context(), repoID)
+	if err != nil {
+		http.Error(w, "Repository not found", http.StatusNotFound)
+		return nil, false
+	}
+	return repo, true
+}
+
+// splitFullName splits "owner/name" into its two parts.
+func splitFullName(fullName string) (owner, name string, ok bool) {
+	parts := strings.SplitN(fullName, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+// repoViewers returns the IDs of the users who may receive events about repoID.
+func (h *Handler) repoViewers(ctx context.Context, repoID int) []int {
+	users, err := h.storage.ListUsersWithRepositoryAccess(ctx, repoID)
+	if err != nil {
+		log.Error().Err(err).Int("repo_id", repoID).Msg("Failed to list repository viewers")
+		return nil
+	}
+	return users
+}
+
 // Health reports process liveness and the release version.
 // Probes use the HTTP status code. The body is JSON for clients.
 func (h *Handler) Health(w http.ResponseWriter, _ *http.Request) {
@@ -90,6 +201,22 @@ func (h *Handler) Health(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// Ready reports whether the storage backend answers. Kubernetes readiness probes use it so a pod
+// whose database is unreachable stops receiving traffic instead of serving an empty dashboard.
+func (h *Handler) Ready(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	if err := h.storage.Ping(ctx); err != nil {
+		log.Warn().Err(err).Msg("Readiness check failed")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "unavailable"})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+
 // ===== Auth Handlers =====
 
 // Login initiates GitHub OAuth
@@ -97,15 +224,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	state := generateState()
 
 	// Store state in cookie
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is dynamic for dev/prod flexibility
-		Name:     "oauth_state",
-		Value:    state,
-		Path:     "/",
-		MaxAge:   300,
-		HttpOnly: true,
-		Secure:   isSecureRequest(r),
-		SameSite: http.SameSiteLaxMode,
-	})
+	http.SetCookie(w, h.authCookie(oauthStateCookieName, state, 300, time.Time{}))
 
 	url := h.ghClient.GetAuthURL(state)
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
@@ -114,22 +233,14 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 // Callback handles GitHub OAuth callback
 func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 	// Verify state
-	stateCookie, err := r.Cookie("oauth_state")
-	if err != nil || stateCookie.Value != r.URL.Query().Get("state") {
+	stateCookie, err := r.Cookie(oauthStateCookieName)
+	if err != nil || stateCookie.Value == "" || subtle.ConstantTimeCompare([]byte(stateCookie.Value), []byte(r.URL.Query().Get("state"))) != 1 {
 		http.Error(w, "Invalid state", http.StatusBadRequest)
 		return
 	}
 
 	// Clear state cookie
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is dynamic for dev/prod flexibility
-		Name:     "oauth_state",
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   isSecureRequest(r),
-		SameSite: http.SameSiteLaxMode,
-	})
+	http.SetCookie(w, h.authCookie(oauthStateCookieName, "", -1, time.Time{}))
 
 	// Exchange code for token
 	code := r.URL.Query().Get("code")
@@ -146,6 +257,19 @@ func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to get user info")
 		http.Error(w, "Failed to get user info", http.StatusInternalServerError)
+		return
+	}
+
+	// Enforce the login allowlist before anything is persisted
+	allowed, err := h.isLoginAllowed(r.Context(), client, ghUser.Login)
+	if err != nil {
+		log.Error().Err(err).Str("login", ghUser.Login).Msg("Failed to evaluate login allowlist")
+		http.Error(w, "Failed to authenticate", http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		log.Warn().Str("login", ghUser.Login).Msg("Login rejected: account not in allowlist")
+		http.Error(w, "This GitHub account is not allowed to sign in", http.StatusForbidden)
 		return
 	}
 
@@ -175,37 +299,48 @@ func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set session cookie
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is dynamic for dev/prod flexibility
-		Name:     "session",
-		Value:    sessionID,
-		Path:     "/",
-		Expires:  expiresAt,
-		HttpOnly: true,
-		Secure:   isSecureRequest(r),
-		SameSite: http.SameSiteLaxMode,
-	})
+	http.SetCookie(w, h.authCookie(h.sessionCookieName(), sessionID, 0, expiresAt))
 
 	// Redirect to frontend
 	http.Redirect(w, r, h.config.FrontendURL, http.StatusTemporaryRedirect)
 }
 
+// isLoginAllowed applies ALLOWED_GITHUB_USERS and ALLOWED_GITHUB_ORGS. With no allowlist every
+// GitHub account may sign in. Organization membership is read with the user's own token.
+func (h *Handler) isLoginAllowed(ctx context.Context, client *gh.Client, login string) (bool, error) {
+	if !h.config.LoginRestricted() {
+		return true, nil
+	}
+	for _, allowed := range h.config.AllowedGitHubUsers {
+		if strings.EqualFold(allowed, login) {
+			return true, nil
+		}
+	}
+	if len(h.config.AllowedGitHubOrgs) == 0 {
+		return false, nil
+	}
+	orgs, err := h.ghClient.ListOrganizations(ctx, client)
+	if err != nil {
+		return false, err
+	}
+	for _, org := range orgs {
+		for _, allowed := range h.config.AllowedGitHubOrgs {
+			if strings.EqualFold(allowed, org.GetLogin()) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // Logout logs out the user
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
-	sessionCookie, err := r.Cookie("session")
-	if err == nil {
-		_ = h.storage.DeleteSession(r.Context(), sessionCookie.Value)
+	if sessionID, ok := h.readSessionCookie(r); ok {
+		_ = h.storage.DeleteSession(r.Context(), sessionID)
 	}
 
 	// Clear session cookie
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is dynamic for dev/prod flexibility
-		Name:     "session",
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   isSecureRequest(r),
-		SameSite: http.SameSiteLaxMode,
-	})
+	http.SetCookie(w, h.authCookie(h.sessionCookieName(), "", -1, time.Time{}))
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -213,8 +348,8 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 // AuthStatus returns the current authentication status
 func (h *Handler) AuthStatus(w http.ResponseWriter, r *http.Request) {
 	// Check session cookie directly (this endpoint is not behind AuthMiddleware)
-	sessionCookie, err := r.Cookie("session")
-	if err != nil {
+	sessionID, ok := h.readSessionCookie(r)
+	if !ok {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"authenticated": false,
 		})
@@ -222,7 +357,7 @@ func (h *Handler) AuthStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get session from storage
-	_, user, err := h.storage.GetSession(r.Context(), sessionCookie.Value)
+	_, user, err := h.storage.GetSession(r.Context(), sessionID)
 	if err != nil || user == nil {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"authenticated": false,
@@ -256,14 +391,14 @@ func (h *Handler) AuthMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		sessionCookie, err := r.Cookie("session")
-		if err != nil {
+		sessionID, ok := h.readSessionCookie(r)
+		if !ok {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		_, user, err := h.storage.GetSession(r.Context(), sessionCookie.Value)
-		if err != nil {
+		_, user, err := h.storage.GetSession(r.Context(), sessionID)
+		if err != nil || user == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -492,7 +627,8 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) processWebhookEvent(eventType string, event interface{}) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
 	switch e := event.(type) {
 	case *gh.WorkflowRunEvent:
@@ -501,14 +637,30 @@ func (h *Handler) processWebhookEvent(eventType string, event interface{}) {
 			Int64("run_id", e.GetWorkflowRun().GetID()).
 			Msg("Processing workflow_run event")
 
-		run := h.convertWorkflowRun(e.GetWorkflowRun(), e.GetRepo())
-		if _, err := h.storage.UpsertRun(ctx, run); err != nil {
+		// Only runs of repositories somebody already synced are stored; the webhook payload alone
+		// does not tell us which users may see the repository.
+		repo, err := h.storage.GetRepositoryByGitHubID(ctx, e.GetRepo().GetID())
+		if err != nil {
+			log.Debug().Int64("repo_github_id", e.GetRepo().GetID()).Msg("Ignoring workflow_run for unknown repository")
+			return
+		}
+		workflow, err := h.storage.GetWorkflowByGitHubID(ctx, e.GetWorkflowRun().GetWorkflowID())
+		if err != nil {
+			log.Debug().Int64("workflow_github_id", e.GetWorkflowRun().GetWorkflowID()).Msg("Ignoring workflow_run for unknown workflow")
+			return
+		}
+
+		run := h.convertWorkflowRun(e.GetWorkflowRun())
+		run.RepoID = repo.ID
+		run.WorkflowID = workflow.ID
+		run.IsDeployment = workflow.IsDeploymentWorkflow || isDeploymentRun(workflow.Name, workflow.Path, run.Event)
+		saved, err := h.storage.UpsertRun(ctx, run)
+		if err != nil {
 			log.Error().Err(err).Msg("Failed to save workflow run")
 			return
 		}
 
-		// Broadcast update via WebSocket
-		h.wsHub.BroadcastWorkflowRunUpdate(run)
+		h.wsHub.SendWorkflowRunUpdate(h.repoViewers(ctx, repo.ID), saved)
 
 	case *gh.WorkflowJobEvent:
 		log.Info().
@@ -516,8 +668,12 @@ func (h *Handler) processWebhookEvent(eventType string, event interface{}) {
 			Int64("job_id", e.GetWorkflowJob().GetID()).
 			Msg("Processing workflow_job event")
 
-		// Broadcast update via WebSocket
-		h.wsHub.BroadcastWorkflowJobUpdate(e.GetWorkflowJob())
+		repo, err := h.storage.GetRepositoryByGitHubID(ctx, e.GetRepo().GetID())
+		if err != nil {
+			log.Debug().Int64("repo_github_id", e.GetRepo().GetID()).Msg("Ignoring workflow_job for unknown repository")
+			return
+		}
+		h.wsHub.SendWorkflowJobUpdate(h.repoViewers(ctx, repo.ID), e.GetWorkflowJob())
 
 	case *gh.DeploymentEvent:
 		log.Info().
@@ -525,7 +681,7 @@ func (h *Handler) processWebhookEvent(eventType string, event interface{}) {
 			Msg("Processing deployment event")
 
 		if dep := h.convertAndPersistDeployment(ctx, e.GetRepo(), e.GetDeployment(), nil); dep != nil {
-			h.wsHub.BroadcastDeploymentUpdate(e.GetDeployment())
+			h.wsHub.SendDeploymentUpdate(h.repoViewers(ctx, dep.RepoID), e.GetDeployment())
 		}
 
 	case *gh.DeploymentStatusEvent:
@@ -536,7 +692,7 @@ func (h *Handler) processWebhookEvent(eventType string, event interface{}) {
 
 		dep := h.convertAndPersistDeploymentStatus(ctx, e.GetRepo(), e.GetDeployment(), e.GetDeploymentStatus())
 		if dep != nil {
-			h.wsHub.BroadcastDeploymentUpdate(e.GetDeployment())
+			h.wsHub.SendDeploymentUpdate(h.repoViewers(ctx, dep.RepoID), e.GetDeployment())
 		}
 	}
 }
@@ -547,12 +703,12 @@ func (h *Handler) processWebhookEvent(eventType string, event interface{}) {
 func (h *Handler) WebSocketHandler(w http.ResponseWriter, r *http.Request) {
 	// Authenticate via session cookie before upgrading; WebSocket connections
 	// bypass standard HTTP middleware once upgraded, so we must check here.
-	sessionCookie, err := r.Cookie("session")
-	if err != nil {
+	sessionID, ok := h.readSessionCookie(r)
+	if !ok {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	_, user, err := h.storage.GetSession(r.Context(), sessionCookie.Value)
+	_, user, err := h.storage.GetSession(r.Context(), sessionID)
 	if err != nil || user == nil {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
@@ -579,12 +735,20 @@ func (h *Handler) WebSocketHandler(w http.ResponseWriter, r *http.Request) {
 
 // ===== Organization Handlers =====
 
-// ListOrganizations lists all organizations
+// ListOrganizations lists the organizations of the repositories the user may see
 func (h *Handler) ListOrganizations(w http.ResponseWriter, r *http.Request) {
-	orgs, err := h.storage.ListOrganizations(r.Context())
+	user := h.getUserFromContext(r.Context())
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	orgs, err := h.storage.ListOrganizations(r.Context(), user.ID)
 	if err != nil {
 		http.Error(w, "Failed to fetch organizations", http.StatusInternalServerError)
 		return
+	}
+	if orgs == nil {
+		orgs = []models.Organization{}
 	}
 
 	_ = json.NewEncoder(w).Encode(orgs)
@@ -592,9 +756,14 @@ func (h *Handler) ListOrganizations(w http.ResponseWriter, r *http.Request) {
 
 // GetOrganization gets a single organization
 func (h *Handler) GetOrganization(w http.ResponseWriter, r *http.Request) {
+	user := h.getUserFromContext(r.Context())
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
 
-	org, err := h.storage.GetOrganization(r.Context(), id)
+	org, err := h.storage.GetOrganization(r.Context(), user.ID, id)
 	if err != nil {
 		http.Error(w, "Organization not found", http.StatusNotFound)
 		return
@@ -605,8 +774,13 @@ func (h *Handler) GetOrganization(w http.ResponseWriter, r *http.Request) {
 
 // ===== Repository Handlers =====
 
-// ListRepositories lists all repositories
+// ListRepositories lists the repositories the user may see
 func (h *Handler) ListRepositories(w http.ResponseWriter, r *http.Request) {
+	user := h.getUserFromContext(r.Context())
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
 		page = 1
@@ -620,10 +794,13 @@ func (h *Handler) ListRepositories(w http.ResponseWriter, r *http.Request) {
 	}
 	search := r.URL.Query().Get("search")
 
-	repos, total, err := h.storage.ListRepositories(r.Context(), page, pageSize, search)
+	repos, total, err := h.storage.ListRepositories(r.Context(), user.ID, page, pageSize, search)
 	if err != nil {
 		http.Error(w, "Failed to fetch repositories", http.StatusInternalServerError)
 		return
+	}
+	if repos == nil {
+		repos = []models.Repository{}
 	}
 
 	_ = json.NewEncoder(w).Encode(models.ListResponse[models.Repository]{
@@ -640,9 +817,8 @@ func (h *Handler) ListRepositories(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetRepository(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
 
-	repo, err := h.storage.GetRepository(r.Context(), id)
-	if err != nil {
-		http.Error(w, "Repository not found", http.StatusNotFound)
+	repo, ok := h.loadAccessibleRepo(w, r, h.getUserFromContext(r.Context()), id)
+	if !ok {
 		return
 	}
 
@@ -652,6 +828,9 @@ func (h *Handler) GetRepository(w http.ResponseWriter, r *http.Request) {
 // GetRepositoryScore returns the latest score for a repository
 func (h *Handler) GetRepositoryScore(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
+	if !h.requireRepoAccess(w, r, h.getUserFromContext(r.Context()), id) {
+		return
+	}
 
 	score, err := h.storage.GetLatestRepositoryScore(r.Context(), id)
 	if err != nil {
@@ -666,12 +845,20 @@ func (h *Handler) GetRepositoryScore(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(score)
 }
 
-// ListRepositoryScores returns the latest score for every repository
+// ListRepositoryScores returns the latest score for every repository the user may see
 func (h *Handler) ListRepositoryScores(w http.ResponseWriter, r *http.Request) {
-	scores, err := h.storage.ListLatestRepositoryScores(r.Context())
+	user := h.getUserFromContext(r.Context())
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	scores, err := h.storage.ListLatestRepositoryScores(r.Context(), user.ID)
 	if err != nil {
 		http.Error(w, "Failed to list scores", http.StatusInternalServerError)
 		return
+	}
+	if scores == nil {
+		scores = []models.RepositoryScore{}
 	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"data": scores,
@@ -715,7 +902,8 @@ func (h *Handler) SyncRepositories(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Copy user token for background goroutine
+	// Copy what the background goroutine needs; the request context ends when the handler returns.
+	userID := user.ID
 	accessToken := user.AccessToken
 
 	// Return immediately - sync runs in background
@@ -725,13 +913,14 @@ func (h *Handler) SyncRepositories(w http.ResponseWriter, r *http.Request) {
 		"message": "Sync started, progress will be sent via WebSocket",
 	})
 
-	// Run sync in background; do not use r.Context() — it is cancelled when the handler returns (after 202),
+	// Run sync in background; do not use r.Context(): it is cancelled when the handler returns (after 202),
 	// which would immediately cancel the sync and trigger sync:error. Use Background so sync runs to completion.
-	go h.runSync(context.Background(), accessToken) // #nosec G118 -- intentional: sync must outlive the HTTP request
+	go h.runSync(context.Background(), userID, accessToken) // #nosec G118 -- intentional: sync must outlive the HTTP request
 }
 
-// runSync performs the actual sync operation in the background
-func (h *Handler) runSync(ctx context.Context, accessToken string) {
+// runSync performs the actual sync operation in the background. Every repository it stores is
+// granted to userID, which is what makes it visible to that user afterwards.
+func (h *Handler) runSync(ctx context.Context, userID int, accessToken string) {
 
 	// Create GitHub client with user's token
 	token := &oauth2.Token{AccessToken: accessToken}
@@ -741,7 +930,7 @@ func (h *Handler) runSync(ctx context.Context, accessToken string) {
 	ghRepos, err := h.ghClient.ListUserRepositories(ctx, client)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to fetch repositories from GitHub")
-		h.wsHub.BroadcastSyncError("Failed to fetch repositories from GitHub")
+		h.wsHub.SendSyncError(userID, "Failed to fetch repositories from GitHub")
 		return
 	}
 
@@ -753,12 +942,10 @@ func (h *Handler) runSync(ctx context.Context, accessToken string) {
 	syncedWorkflows := 0
 	syncedRuns := 0
 
-	// Broadcast sync start
-	h.wsHub.BroadcastSyncStart(total)
+	h.wsHub.SendSyncStart(userID, total)
 
 	for i, ghRepo := range ghRepos {
-		// Broadcast progress
-		h.wsHub.BroadcastSyncProgress(i, total, ghRepo.GetFullName())
+		h.wsHub.SendSyncProgress(userID, i, total, ghRepo.GetFullName())
 
 		// Convert and save repository
 		repo := &models.Repository{
@@ -777,6 +964,10 @@ func (h *Handler) runSync(ctx context.Context, accessToken string) {
 		savedRepo, err := h.storage.UpsertRepository(ctx, repo)
 		if err != nil {
 			log.Error().Err(err).Str("repo", ghRepo.GetFullName()).Msg("Failed to save repository")
+			continue
+		}
+		if err := h.storage.GrantRepositoryAccess(ctx, userID, savedRepo.ID); err != nil {
+			log.Error().Err(err).Str("repo", ghRepo.GetFullName()).Msg("Failed to grant repository access")
 			continue
 		}
 		syncedRepos++
@@ -904,23 +1095,22 @@ func (h *Handler) runSync(ctx context.Context, accessToken string) {
 	}
 
 	log.Info().
+		Int("user_id", userID).
 		Int("repositories", syncedRepos).
 		Int("workflows", syncedWorkflows).
 		Int("runs", syncedRuns).
 		Msg("Sync completed")
 
-	// Broadcast sync complete
-	h.wsHub.BroadcastSyncComplete(syncedRepos, syncedWorkflows, syncedRuns)
+	h.wsHub.SendSyncComplete(userID, syncedRepos, syncedWorkflows, syncedRuns)
 }
 
 // runSyncOneRepo syncs workflows and runs for a single repository (light sync).
 // repo must exist in storage; owner/name are derived from repo.FullName.
 func (h *Handler) runSyncOneRepo(ctx context.Context, client *gh.Client, repo *models.Repository) (syncedWorkflows, syncedRuns int, err error) {
-	parts := strings.SplitN(repo.FullName, "/", 2)
-	if len(parts) != 2 {
+	owner, repoName, ok := splitFullName(repo.FullName)
+	if !ok {
 		return 0, 0, errors.New("invalid repository full_name")
 	}
-	owner, repoName := parts[0], parts[1]
 
 	ghWorkflows, err := h.ghClient.ListWorkflows(ctx, client, owner, repoName)
 	if err != nil {
@@ -1027,9 +1217,8 @@ func (h *Handler) SyncRepository(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	repo, err := h.storage.GetRepository(r.Context(), repoID)
-	if err != nil || repo == nil {
-		http.Error(w, "Repository not found", http.StatusNotFound)
+	repo, ok := h.loadAccessibleRepo(w, r, user, repoID)
+	if !ok {
 		return
 	}
 
@@ -1039,19 +1228,17 @@ func (h *Handler) SyncRepository(w http.ResponseWriter, r *http.Request) {
 	workflows, runs, err := h.runSyncOneRepo(r.Context(), client, repo)
 	if err != nil {
 		log.Error().Err(err).Int("repo_id", repoID).Str("repo", repo.FullName).Msg("Light sync failed")
-		http.Error(w, "Sync failed: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Sync failed: GitHub did not return the repository data", http.StatusBadGateway)
 		return
 	}
 
 	// Re-score the repository from GitHub (fetch fresh metadata, then run scorer)
 	scoreUpdated := false
 	if h.scorer != nil {
-		parts := strings.SplitN(repo.FullName, "/", 2)
-		if len(parts) == 2 {
-			owner, repoName := parts[0], parts[1]
+		if owner, repoName, ok := splitFullName(repo.FullName); ok {
 			ghRepo, errGh := h.ghClient.GetRepository(r.Context(), client, owner, repoName)
 			if errGh == nil && ghRepo != nil {
-				workflowsList, _ := h.storage.ListWorkflows(r.Context(), &repoID)
+				workflowsList, _ := h.storage.ListWorkflows(r.Context(), user.ID, &repoID)
 				meta := &scorer.RepoMeta{
 					HasWorkflows:  len(workflowsList) > 0,
 					WorkflowNames: make([]string, 0, len(workflowsList)),
@@ -1084,9 +1271,14 @@ func (h *Handler) SyncRepository(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// BackfillDeploymentRuns retroactively sets is_deployment on existing workflow runs that match deployment heuristics.
+// BackfillDeploymentRuns retroactively sets is_deployment on the user's workflow runs that match deployment heuristics.
 func (h *Handler) BackfillDeploymentRuns(w http.ResponseWriter, r *http.Request) {
-	updated, err := h.storage.BackfillDeploymentRuns(r.Context())
+	user := h.getUserFromContext(r.Context())
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	updated, err := h.storage.BackfillDeploymentRuns(r.Context(), user.ID)
 	if err != nil {
 		http.Error(w, "Failed to backfill deployment runs", http.StatusInternalServerError)
 		return
@@ -1096,30 +1288,50 @@ func (h *Handler) BackfillDeploymentRuns(w http.ResponseWriter, r *http.Request)
 
 // ===== Workflow Handlers =====
 
-// ListWorkflows lists all workflows
+// ListWorkflows lists the workflows of the repositories the user may see
 func (h *Handler) ListWorkflows(w http.ResponseWriter, r *http.Request) {
+	user := h.getUserFromContext(r.Context())
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	var repoID *int
 	if repoIDStr := r.URL.Query().Get("repo_id"); repoIDStr != "" {
 		id, _ := strconv.Atoi(repoIDStr)
 		repoID = &id
 	}
 
-	workflows, err := h.storage.ListWorkflows(r.Context(), repoID)
+	workflows, err := h.storage.ListWorkflows(r.Context(), user.ID, repoID)
 	if err != nil {
 		http.Error(w, "Failed to fetch workflows", http.StatusInternalServerError)
 		return
 	}
+	if workflows == nil {
+		workflows = []models.Workflow{}
+	}
 
 	_ = json.NewEncoder(w).Encode(workflows)
+}
+
+// loadAccessibleWorkflow fetches a workflow and verifies the user may see its repository.
+func (h *Handler) loadAccessibleWorkflow(w http.ResponseWriter, r *http.Request, user *models.User, id int) (*models.Workflow, bool) {
+	wf, err := h.storage.GetWorkflow(r.Context(), id)
+	if err != nil {
+		http.Error(w, "Workflow not found", http.StatusNotFound)
+		return nil, false
+	}
+	if !h.requireRepoAccess(w, r, user, wf.RepoID) {
+		return nil, false
+	}
+	return wf, true
 }
 
 // GetWorkflow gets a single workflow
 func (h *Handler) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
 
-	wf, err := h.storage.GetWorkflow(r.Context(), id)
-	if err != nil {
-		http.Error(w, "Workflow not found", http.StatusNotFound)
+	wf, ok := h.loadAccessibleWorkflow(w, r, h.getUserFromContext(r.Context()), id)
+	if !ok {
 		return
 	}
 
@@ -1130,9 +1342,8 @@ func (h *Handler) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) UpdateWorkflow(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
 
-	existing, err := h.storage.GetWorkflow(r.Context(), id)
-	if err != nil {
-		http.Error(w, "Workflow not found", http.StatusNotFound)
+	existing, ok := h.loadAccessibleWorkflow(w, r, h.getUserFromContext(r.Context()), id)
+	if !ok {
 		return
 	}
 
@@ -1160,17 +1371,26 @@ func (h *Handler) UpdateWorkflow(w http.ResponseWriter, r *http.Request) {
 // GetWorkflowRuns gets runs for a workflow
 func (h *Handler) GetWorkflowRuns(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
-	h.listRunsWithFilter(w, r, &models.RunFilters{WorkflowID: id})
+	user := h.getUserFromContext(r.Context())
+	if _, ok := h.loadAccessibleWorkflow(w, r, user, id); !ok {
+		return
+	}
+	h.listRunsWithFilter(w, r, user, &models.RunFilters{WorkflowID: id})
 }
 
 // ===== Run Handlers =====
 
-// ListRuns lists all workflow runs
+// ListRuns lists the workflow runs of the repositories the user may see
 func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
-	h.listRunsWithFilter(w, r, nil)
+	user := h.getUserFromContext(r.Context())
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	h.listRunsWithFilter(w, r, user, nil)
 }
 
-func (h *Handler) listRunsWithFilter(w http.ResponseWriter, r *http.Request, baseFilters *models.RunFilters) {
+func (h *Handler) listRunsWithFilter(w http.ResponseWriter, r *http.Request, user *models.User, baseFilters *models.RunFilters) {
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
 		page = 1
@@ -1193,11 +1413,14 @@ func (h *Handler) listRunsWithFilter(w http.ResponseWriter, r *http.Request, bas
 		filters.Branch = branch
 	}
 
-	runs, total, err := h.storage.ListRuns(r.Context(), filters, page, pageSize)
+	runs, total, err := h.storage.ListRuns(r.Context(), user.ID, filters, page, pageSize)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to fetch runs")
 		http.Error(w, "Failed to fetch runs", http.StatusInternalServerError)
 		return
+	}
+	if runs == nil {
+		runs = []models.WorkflowRun{}
 	}
 
 	_ = json.NewEncoder(w).Encode(models.ListResponse[models.WorkflowRun]{
@@ -1214,19 +1437,24 @@ func (h *Handler) listRunsWithFilter(w http.ResponseWriter, r *http.Request, bas
 // If query param refresh=true is set and the user is authenticated, the handler first pulls the latest
 // workflow runs from GitHub for all known repos (so newly triggered pipelines appear), then returns the list.
 func (h *Handler) ListActivePipelines(w http.ResponseWriter, r *http.Request) {
+	user := h.getUserFromContext(r.Context())
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	refresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "1"
 	if refresh {
-		user := h.getUserFromContext(r.Context())
-		if user != nil {
-			h.pullLatestRunsFromGitHub(r.Context(), user)
-		}
+		h.pullLatestRunsFromGitHub(r.Context(), user)
 	}
 
-	runs, err := h.storage.ListActivePipelines(r.Context())
+	runs, err := h.storage.ListActivePipelines(r.Context(), user.ID)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to fetch active pipelines")
 		http.Error(w, "Failed to fetch active pipelines", http.StatusInternalServerError)
 		return
+	}
+	if runs == nil {
+		runs = []models.WorkflowRun{}
 	}
 	_ = json.NewEncoder(w).Encode(runs)
 }
@@ -1237,18 +1465,15 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
 	refresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "1"
 
-	run, err := h.storage.GetRun(r.Context(), id)
-	if err != nil {
-		http.Error(w, "Run not found", http.StatusNotFound)
+	user := h.getUserFromContext(r.Context())
+	run, ok := h.loadAccessibleRun(w, r, user, id)
+	if !ok {
 		return
 	}
 
 	if refresh {
-		user := h.getUserFromContext(r.Context())
-		if user != nil {
-			if updated, errRefresh := h.refreshRunFromGitHub(r.Context(), run, user); errRefresh == nil {
-				run = updated
-			}
+		if updated, errRefresh := h.refreshRunFromGitHub(r.Context(), run, user); errRefresh == nil {
+			run = updated
 		}
 	}
 
@@ -1260,6 +1485,12 @@ func (h *Handler) GetRunJobs(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
 	refresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "1"
 
+	user := h.getUserFromContext(r.Context())
+	run, ok := h.loadAccessibleRun(w, r, user, id)
+	if !ok {
+		return
+	}
+
 	if !refresh {
 		// Return cached jobs if available
 		jobs, err := h.storage.ListJobsForRun(r.Context(), id)
@@ -1269,37 +1500,17 @@ func (h *Handler) GetRunJobs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Fetch fresh jobs from GitHub
-	user := h.getUserFromContext(r.Context())
-	if user == nil {
-		// Fallback to cached if not authenticated
-		jobs, err := h.storage.ListJobsForRun(r.Context(), id)
-		if err == nil && len(jobs) > 0 {
-			_ = json.NewEncoder(w).Encode(jobs)
-			return
-		}
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	run, err := h.storage.GetRun(r.Context(), id)
-	if err != nil {
-		http.Error(w, "Run not found", http.StatusNotFound)
-		return
-	}
-
 	repo, err := h.storage.GetRepository(r.Context(), run.RepoID)
 	if err != nil {
 		http.Error(w, "Repository not found", http.StatusNotFound)
 		return
 	}
 
-	parts := strings.Split(repo.FullName, "/")
-	if len(parts) != 2 {
+	owner, repoName, ok := splitFullName(repo.FullName)
+	if !ok {
 		http.Error(w, "Invalid repository name", http.StatusInternalServerError)
 		return
 	}
-	owner, repoName := parts[0], parts[1]
 
 	token := &oauth2.Token{AccessToken: user.AccessToken}
 	client := h.ghClient.GetUserClient(r.Context(), token)
@@ -1332,9 +1543,13 @@ func (h *Handler) GetRunJobs(w http.ResponseWriter, r *http.Request) {
 
 // GetRunLogs gets logs URL for a run
 func (h *Handler) GetRunLogs(w http.ResponseWriter, r *http.Request) {
-	// For now, return a placeholder
+	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
+	if _, ok := h.loadAccessibleRun(w, r, h.getUserFromContext(r.Context()), id); !ok {
+		return
+	}
+	// Run-level log archives need a GitHub App installation token; job logs are available per job.
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"message": "Logs retrieval requires GitHub App installation token",
+		"message": "Run-level logs are not available; use the per-job logs endpoint",
 	})
 }
 
@@ -1343,15 +1558,8 @@ func (h *Handler) GetRunAnnotations(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
 
 	user := h.getUserFromContext(r.Context())
-	if user == nil {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// Get the run to find GitHub ID and repo
-	run, err := h.storage.GetRun(r.Context(), id)
-	if err != nil {
-		http.Error(w, "Run not found", http.StatusNotFound)
+	run, ok := h.loadAccessibleRun(w, r, user, id)
+	if !ok {
 		return
 	}
 
@@ -1362,13 +1570,11 @@ func (h *Handler) GetRunAnnotations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse owner and repo name from full_name
-	parts := strings.Split(repo.FullName, "/")
-	if len(parts) != 2 {
+	owner, repoName, ok := splitFullName(repo.FullName)
+	if !ok {
 		http.Error(w, "Invalid repository name", http.StatusInternalServerError)
 		return
 	}
-	owner, repoName := parts[0], parts[1]
 
 	// Create GitHub client with user's token
 	token := &oauth2.Token{AccessToken: user.AccessToken}
@@ -1395,17 +1601,16 @@ func (h *Handler) GetJobLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get the job from storage
+	// Get the job from storage. Same message as the access check so job IDs cannot be enumerated.
 	job, err := h.storage.GetJob(r.Context(), id)
 	if err != nil {
-		http.Error(w, "Job not found", http.StatusNotFound)
+		http.Error(w, "Not found", http.StatusNotFound)
 		return
 	}
 
-	// Get the run to find the repo
-	run, err := h.storage.GetRun(r.Context(), job.RunID)
-	if err != nil {
-		http.Error(w, "Run not found", http.StatusNotFound)
+	// Get the run to find the repo and verify access
+	run, ok := h.loadAccessibleRun(w, r, user, job.RunID)
+	if !ok {
 		return
 	}
 
@@ -1416,13 +1621,11 @@ func (h *Handler) GetJobLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse owner and repo name
-	parts := strings.Split(repo.FullName, "/")
-	if len(parts) != 2 {
+	owner, repoName, ok := splitFullName(repo.FullName)
+	if !ok {
 		http.Error(w, "Invalid repository name", http.StatusInternalServerError)
 		return
 	}
-	owner, repoName := parts[0], parts[1]
 
 	// Create GitHub client with user's token
 	token := &oauth2.Token{AccessToken: user.AccessToken}
@@ -1528,20 +1731,62 @@ func (h *Handler) extractJobDependencies(workflowDef *WorkflowDefinition, prefix
 	return dependencies
 }
 
+// Reusable workflow references are content controlled by whoever writes to the monitored
+// repository. They drive GitHub API calls made with the viewer's token, so only the documented
+// shapes are accepted: "./.github/workflows/file.yml" or "owner/repo/.github/workflows/file.yml@ref".
+var (
+	reusableWorkflowPathPattern = regexp.MustCompile(`^\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml$`)
+	gitHubNamePattern           = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+	gitRefPattern               = regexp.MustCompile(`^[A-Za-z0-9_./-]+$`)
+)
+
+// reusableWorkflowRef is a validated reference to a reusable workflow file.
+type reusableWorkflowRef struct {
+	owner, repo, path, ref string
+	isLocal                bool
+}
+
+// parseReusableWorkflowRef validates a `uses:` value. localOwner, localRepo and localRef describe the
+// calling repository and are used for "./" references.
+func parseReusableWorkflowRef(uses, localOwner, localRepo, localRef string) (reusableWorkflowRef, bool) {
+	if strings.HasPrefix(uses, "./") {
+		path := strings.TrimPrefix(uses, "./")
+		if at := strings.Index(path, "@"); at >= 0 {
+			path = path[:at]
+		}
+		if !reusableWorkflowPathPattern.MatchString(path) {
+			return reusableWorkflowRef{}, false
+		}
+		return reusableWorkflowRef{owner: localOwner, repo: localRepo, path: path, ref: localRef, isLocal: true}, true
+	}
+
+	ref := "main"
+	spec := uses
+	if at := strings.LastIndex(spec, "@"); at >= 0 {
+		ref = spec[at+1:]
+		spec = spec[:at]
+	}
+	parts := strings.SplitN(spec, "/", 3)
+	if len(parts) != 3 {
+		return reusableWorkflowRef{}, false
+	}
+	owner, repo, path := parts[0], parts[1], parts[2]
+	if !gitHubNamePattern.MatchString(owner) || !gitHubNamePattern.MatchString(repo) {
+		return reusableWorkflowRef{}, false
+	}
+	if !reusableWorkflowPathPattern.MatchString(path) || !gitRefPattern.MatchString(ref) || strings.Contains(ref, "..") {
+		return reusableWorkflowRef{}, false
+	}
+	return reusableWorkflowRef{owner: owner, repo: repo, path: path, ref: ref}, true
+}
+
 // GetRunWorkflowDefinition fetches and parses the workflow YAML to extract job dependencies
 func (h *Handler) GetRunWorkflowDefinition(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
 
 	user := h.getUserFromContext(r.Context())
-	if user == nil {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// Get the run to find workflow info
-	run, err := h.storage.GetRun(r.Context(), id)
-	if err != nil {
-		http.Error(w, "Run not found", http.StatusNotFound)
+	run, ok := h.loadAccessibleRun(w, r, user, id)
+	if !ok {
 		return
 	}
 
@@ -1559,13 +1804,11 @@ func (h *Handler) GetRunWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Parse owner and repo name
-	parts := strings.Split(repo.FullName, "/")
-	if len(parts) != 2 {
+	owner, repoName, ok := splitFullName(repo.FullName)
+	if !ok {
 		http.Error(w, "Invalid repository name", http.StatusInternalServerError)
 		return
 	}
-	owner, repoName := parts[0], parts[1]
 
 	// Create GitHub client with user's token
 	token := &oauth2.Token{AccessToken: user.AccessToken}
@@ -1591,18 +1834,6 @@ func (h *Handler) GetRunWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 	// Extract job dependencies, handling reusable workflows
 	allDependencies := []JobDependency{}
 
-	// DEBUG: Log the parsed workflow structure
-	log.Debug().Int("job_count", len(workflowDef.Jobs)).Msg("Parsed workflow definition")
-	for jobID, jobDef := range workflowDef.Jobs {
-		log.Debug().
-			Str("job_id", jobID).
-			Str("name", jobDef.Name).
-			Str("uses", jobDef.Uses).
-			Interface("needs", jobDef.Needs).
-			Bool("has_strategy", jobDef.Strategy != nil).
-			Msg("Job definition details")
-	}
-
 	for jobID, jobDef := range workflowDef.Jobs {
 		callingJobNeeds := parseWorkflowNeeds(jobDef.Needs)
 		callingJobName := jobDef.Name
@@ -1612,96 +1843,46 @@ func (h *Handler) GetRunWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 
 		// Check if this job uses a reusable workflow
 		if jobDef.Uses != "" {
-			// Try to fetch and parse the reusable workflow
-			reusablePath := jobDef.Uses
-			log.Debug().Str("uses", reusablePath).Str("calling_job", callingJobName).Msg("Processing reusable workflow reference")
+			// The calling job is reported as a single node whenever the reusable workflow cannot be expanded.
+			singleJob := JobDependency{
+				JobID:    jobID,
+				Name:     callingJobName,
+				Needs:    callingJobNeeds,
+				IsMatrix: jobDef.Strategy != nil && jobDef.Strategy.Matrix != nil,
+				Prefix:   callingJobName,
+			}
 
-			var reusableOwner, reusableRepo, reusableFilePath, reusableRef string
-			var isLocal bool
-
-			if strings.HasPrefix(reusablePath, "./") {
-				// Local workflow file
-				isLocal = true
-				reusableFilePath = strings.TrimPrefix(reusablePath, "./")
-				// Remove any @ref suffix
-				if atIdx := strings.Index(reusableFilePath, "@"); atIdx > 0 {
-					reusableFilePath = reusableFilePath[:atIdx]
-				}
-				reusableOwner = owner
-				reusableRepo = repoName
-				reusableRef = run.CommitSHA
-			} else {
-				// External reusable workflow: org/repo/.github/workflows/file.yml@ref
-				// or org/repo/path/to/workflow.yml@ref
-				isLocal = false
-
-				// Parse the external workflow path
-				// Format: {owner}/{repo}/{path}@{ref} or {owner}/{repo}/.github/workflows/{filename}@{ref}
-				atIdx := strings.LastIndex(reusablePath, "@")
-				if atIdx > 0 {
-					reusableRef = reusablePath[atIdx+1:]
-					reusablePath = reusablePath[:atIdx]
-				} else {
-					reusableRef = "main" // Default to main if no ref specified
-				}
-
-				// Split the path: owner/repo/path/to/file.yml
-				pathParts := strings.SplitN(reusablePath, "/", 3)
-				if len(pathParts) >= 3 {
-					reusableOwner = pathParts[0]
-					reusableRepo = pathParts[1]
-					reusableFilePath = pathParts[2]
-				} else {
-					log.Warn().Str("uses", jobDef.Uses).Msg("Could not parse external workflow path")
-					allDependencies = append(allDependencies, JobDependency{
-						JobID:    jobID,
-						Name:     callingJobName,
-						Needs:    callingJobNeeds,
-						IsMatrix: jobDef.Strategy != nil && jobDef.Strategy.Matrix != nil,
-						Prefix:   callingJobName,
-					})
-					continue
-				}
+			reusable, ok := parseReusableWorkflowRef(jobDef.Uses, owner, repoName, run.CommitSHA)
+			if !ok {
+				log.Warn().Str("uses", jobDef.Uses).Msg("Unsupported reusable workflow reference, adding as single job")
+				allDependencies = append(allDependencies, singleJob)
+				continue
 			}
 
 			log.Debug().
-				Bool("is_local", isLocal).
-				Str("owner", reusableOwner).
-				Str("repo", reusableRepo).
-				Str("path", reusableFilePath).
-				Str("ref", reusableRef).
+				Bool("is_local", reusable.isLocal).
+				Str("owner", reusable.owner).
+				Str("repo", reusable.repo).
+				Str("path", reusable.path).
+				Str("ref", reusable.ref).
 				Msg("Fetching reusable workflow")
 
-			reusableContent, err := h.ghClient.GetWorkflowContent(r.Context(), client, reusableOwner, reusableRepo, reusableFilePath, reusableRef)
+			reusableContent, err := h.ghClient.GetWorkflowContent(r.Context(), client, reusable.owner, reusable.repo, reusable.path, reusable.ref)
 			if err != nil {
-				// Use Debug level for 404s (expected when workflow doesn't exist or no access)
-				// Use Warn level for unexpected errors (server errors, network issues)
+				// 404 is expected when the workflow does not exist or the viewer has no access
 				if isGitHubNotFoundError(err) {
-					log.Debug().Str("path", reusableFilePath).Str("owner", reusableOwner).Str("repo", reusableRepo).Msg("Reusable workflow not found, adding as single job")
+					log.Debug().Str("path", reusable.path).Str("owner", reusable.owner).Str("repo", reusable.repo).Msg("Reusable workflow not found, adding as single job")
 				} else {
-					log.Warn().Err(err).Str("path", reusableFilePath).Str("owner", reusableOwner).Str("repo", reusableRepo).Msg("Failed to fetch reusable workflow, adding as single job")
+					log.Warn().Err(err).Str("path", reusable.path).Str("owner", reusable.owner).Str("repo", reusable.repo).Msg("Failed to fetch reusable workflow, adding as single job")
 				}
-				// Add the calling job as a single entry with prefix
-				allDependencies = append(allDependencies, JobDependency{
-					JobID:    jobID,
-					Name:     callingJobName,
-					Needs:    callingJobNeeds,
-					IsMatrix: jobDef.Strategy != nil && jobDef.Strategy.Matrix != nil,
-					Prefix:   callingJobName,
-				})
+				allDependencies = append(allDependencies, singleJob)
 				continue
 			}
 
 			var reusableWorkflowDef WorkflowDefinition
 			if err := yaml.Unmarshal(reusableContent, &reusableWorkflowDef); err != nil {
-				log.Warn().Err(err).Str("path", reusableFilePath).Msg("Failed to parse reusable workflow YAML")
-				allDependencies = append(allDependencies, JobDependency{
-					JobID:    jobID,
-					Name:     callingJobName,
-					Needs:    callingJobNeeds,
-					IsMatrix: jobDef.Strategy != nil && jobDef.Strategy.Matrix != nil,
-					Prefix:   callingJobName,
-				})
+				log.Warn().Err(err).Str("path", reusable.path).Msg("Failed to parse reusable workflow YAML")
+				allDependencies = append(allDependencies, singleJob)
 				continue
 			}
 
@@ -1724,19 +1905,22 @@ func (h *Handler) GetRunWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 	_ = json.NewEncoder(w).Encode(allDependencies)
 }
 
+// gitHubStatus returns the HTTP status GitHub answered with, or 0 for non-GitHub errors.
+func gitHubStatus(err error) int {
+	var ghErr *gh.ErrorResponse
+	if errors.As(err, &ghErr) && ghErr.Response != nil {
+		return ghErr.Response.StatusCode
+	}
+	return 0
+}
+
 // RerunWorkflow reruns a workflow on GitHub
 func (h *Handler) RerunWorkflow(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
 
 	user := h.getUserFromContext(r.Context())
-	if user == nil {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	run, err := h.storage.GetRun(r.Context(), id)
-	if err != nil {
-		http.Error(w, "Run not found", http.StatusNotFound)
+	run, ok := h.loadAccessibleRun(w, r, user, id)
+	if !ok {
 		return
 	}
 
@@ -1746,38 +1930,28 @@ func (h *Handler) RerunWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parts := strings.Split(repo.FullName, "/")
-	if len(parts) != 2 {
+	owner, repoName, ok := splitFullName(repo.FullName)
+	if !ok {
 		http.Error(w, "Invalid repository name", http.StatusInternalServerError)
 		return
 	}
-	owner, repoName := parts[0], parts[1]
 
 	token := &oauth2.Token{AccessToken: user.AccessToken}
 	client := h.ghClient.GetUserClient(r.Context(), token)
 
 	if err := h.ghClient.RerunWorkflow(r.Context(), client, owner, repoName, run.GitHubID); err != nil {
 		log.Error().Err(err).Int("run_id", id).Int64("github_id", run.GitHubID).Msg("Failed to re-run workflow")
-		errMsg := err.Error()
-		var ghErr *gh.ErrorResponse
-		if errors.As(err, &ghErr) && ghErr.Response != nil {
-			switch ghErr.Response.StatusCode {
-			case http.StatusConflict:
-				if strings.Contains(errMsg, "re-run") && strings.Contains(errMsg, "not yet") {
-					http.Error(w, "This run cannot be re-run yet. Try again in a moment.", http.StatusConflict)
-					return
-				}
-				http.Error(w, "Re-run not allowed: "+errMsg, http.StatusConflict)
-				return
-			case http.StatusForbidden:
-				http.Error(w, "You do not have permission to re-run this workflow.", http.StatusForbidden)
-				return
-			case http.StatusNotFound:
-				http.Error(w, "Workflow run not found on GitHub.", http.StatusNotFound)
-				return
-			}
+		// GitHub error strings include the full API URL, so only fixed messages reach the client.
+		switch gitHubStatus(err) {
+		case http.StatusConflict:
+			http.Error(w, "This run cannot be re-run right now. Wait for it to finish or try again in a moment.", http.StatusConflict)
+		case http.StatusForbidden:
+			http.Error(w, "You do not have permission to re-run this workflow.", http.StatusForbidden)
+		case http.StatusNotFound:
+			http.Error(w, "Workflow run not found on GitHub.", http.StatusNotFound)
+		default:
+			http.Error(w, "GitHub did not accept the re-run request.", http.StatusBadGateway)
 		}
-		http.Error(w, "Failed to re-run: "+errMsg, http.StatusInternalServerError)
 		return
 	}
 
@@ -1790,14 +1964,8 @@ func (h *Handler) CancelRun(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(chi.URLParam(r, "id"))
 
 	user := h.getUserFromContext(r.Context())
-	if user == nil {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	run, err := h.storage.GetRun(r.Context(), id)
-	if err != nil {
-		http.Error(w, "Run not found", http.StatusNotFound)
+	run, ok := h.loadAccessibleRun(w, r, user, id)
+	if !ok {
 		return
 	}
 
@@ -1812,28 +1980,28 @@ func (h *Handler) CancelRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parts := strings.Split(repo.FullName, "/")
-	if len(parts) != 2 {
+	owner, repoName, ok := splitFullName(repo.FullName)
+	if !ok {
 		http.Error(w, "Invalid repository name", http.StatusInternalServerError)
 		return
 	}
-	owner, repoName := parts[0], parts[1]
 
 	token := &oauth2.Token{AccessToken: user.AccessToken}
 	client := h.ghClient.GetUserClient(r.Context(), token)
 
 	if err := h.ghClient.CancelWorkflowRun(r.Context(), client, owner, repoName, run.GitHubID); err != nil {
 		log.Error().Err(err).Int("run_id", id).Int64("github_id", run.GitHubID).Msg("Failed to cancel workflow run")
-		errMsg := err.Error()
-		// GitHub returns 409 for re-runs that have not yet queued - return user-friendly message
-		var ghErr *gh.ErrorResponse
-		if errors.As(err, &ghErr) && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusConflict {
-			if strings.Contains(errMsg, "re-run") && strings.Contains(errMsg, "not yet queued") {
-				http.Error(w, "This run cannot be cancelled yet. Re-runs must be queued before they can be cancelled. Try again in a moment.", http.StatusConflict)
-				return
-			}
+		switch gitHubStatus(err) {
+		case http.StatusConflict:
+			// GitHub returns 409 for re-runs that have not yet queued
+			http.Error(w, "This run cannot be cancelled yet. Re-runs must be queued before they can be cancelled. Try again in a moment.", http.StatusConflict)
+		case http.StatusForbidden:
+			http.Error(w, "You do not have permission to cancel this run.", http.StatusForbidden)
+		case http.StatusNotFound:
+			http.Error(w, "Workflow run not found on GitHub.", http.StatusNotFound)
+		default:
+			http.Error(w, "GitHub did not accept the cancel request.", http.StatusBadGateway)
 		}
-		http.Error(w, "Failed to cancel run: "+errMsg, http.StatusInternalServerError)
 		return
 	}
 
@@ -1842,9 +2010,14 @@ func (h *Handler) CancelRun(w http.ResponseWriter, r *http.Request) {
 
 // ===== Dashboard Handlers =====
 
-// GetDashboardSummary returns dashboard summary
+// GetDashboardSummary returns the dashboard summary for the repositories the user may see
 func (h *Handler) GetDashboardSummary(w http.ResponseWriter, r *http.Request) {
-	summary, err := h.storage.GetDashboardSummary(r.Context())
+	user := h.getUserFromContext(r.Context())
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	summary, err := h.storage.GetDashboardSummary(r.Context(), user.ID)
 	if err != nil {
 		http.Error(w, "Failed to fetch dashboard summary", http.StatusInternalServerError)
 		return
@@ -1853,17 +2026,31 @@ func (h *Handler) GetDashboardSummary(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(summary)
 }
 
+// maxTrendDays bounds the trends window so a single request cannot scan the whole hypertable.
+const maxTrendDays = 365
+
 // GetTrends returns trend data
 func (h *Handler) GetTrends(w http.ResponseWriter, r *http.Request) {
+	user := h.getUserFromContext(r.Context())
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	days, _ := strconv.Atoi(r.URL.Query().Get("days"))
 	if days <= 0 {
 		days = 30
 	}
+	if days > maxTrendDays {
+		days = maxTrendDays
+	}
 
-	trends, err := h.storage.GetTrends(r.Context(), days)
+	trends, err := h.storage.GetTrends(r.Context(), user.ID, days)
 	if err != nil {
 		http.Error(w, "Failed to fetch trends", http.StatusInternalServerError)
 		return
+	}
+	if trends == nil {
+		trends = []models.Trend{}
 	}
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1906,7 +2093,7 @@ func (h *Handler) pullLatestRunsFromGitHub(ctx context.Context, user *models.Use
 	token := &oauth2.Token{AccessToken: user.AccessToken}
 	client := h.ghClient.GetUserClient(ctx, token)
 
-	repos, _, err := h.storage.ListRepositories(ctx, 1, 50, "")
+	repos, _, err := h.storage.ListRepositories(ctx, user.ID, 1, 50, "")
 	if err != nil || len(repos) == 0 {
 		return
 	}
@@ -1915,13 +2102,12 @@ func (h *Handler) pullLatestRunsFromGitHub(ctx context.Context, user *models.Use
 		if ctx.Err() != nil {
 			break
 		}
-		parts := strings.Split(repo.FullName, "/")
-		if len(parts) != 2 {
+		owner, repoName, ok := splitFullName(repo.FullName)
+		if !ok {
 			continue
 		}
-		owner, repoName := parts[0], parts[1]
 
-		workflows, err := h.storage.ListWorkflows(ctx, &repo.ID)
+		workflows, err := h.storage.ListWorkflows(ctx, user.ID, &repo.ID)
 		if err != nil || len(workflows) == 0 {
 			continue
 		}
@@ -1991,18 +2177,17 @@ func (h *Handler) refreshRunFromGitHub(ctx context.Context, run *models.Workflow
 	if err != nil {
 		return run, err
 	}
-	parts := strings.Split(repo.FullName, "/")
-	if len(parts) != 2 {
+	owner, repoName, ok := splitFullName(repo.FullName)
+	if !ok {
 		return run, errors.New("invalid repo full name")
 	}
-	owner, repoName := parts[0], parts[1]
 	token := &oauth2.Token{AccessToken: user.AccessToken}
 	client := h.ghClient.GetUserClient(ctx, token)
 	ghRun, err := h.ghClient.GetWorkflowRun(ctx, client, owner, repoName, run.GitHubID)
 	if err != nil {
 		return run, err
 	}
-	updated := h.convertWorkflowRun(ghRun, nil)
+	updated := h.convertWorkflowRun(ghRun)
 	updated.RepoID = run.RepoID
 	updated.WorkflowID = run.WorkflowID
 	saved, err := h.storage.UpsertRun(ctx, updated)
@@ -2012,27 +2197,9 @@ func (h *Handler) refreshRunFromGitHub(ctx context.Context, run *models.Workflow
 	return saved, nil
 }
 
-// refreshRunsFromGitHub refreshes each run from GitHub with a capped timeout. Runs that fail to refresh are left unchanged.
-func (h *Handler) refreshRunsFromGitHub(ctx context.Context, runs []models.WorkflowRun, user *models.User) []models.WorkflowRun {
-	const refreshTimeout = 15 * time.Second
-	ctx, cancel := context.WithTimeout(ctx, refreshTimeout)
-	defer cancel()
-
-	result := make([]models.WorkflowRun, len(runs))
-	copy(result, runs)
-	for i := range result {
-		if ctx.Err() != nil {
-			break
-		}
-		updated, err := h.refreshRunFromGitHub(ctx, &result[i], user)
-		if err == nil {
-			result[i] = *updated
-		}
-	}
-	return result
-}
-
-func (h *Handler) convertWorkflowRun(run *gh.WorkflowRun, repo *gh.Repository) *models.WorkflowRun {
+// convertWorkflowRun maps a GitHub run to the storage model. RepoID and WorkflowID are left for the
+// caller, which knows the internal identifiers.
+func (h *Handler) convertWorkflowRun(run *gh.WorkflowRun) *models.WorkflowRun {
 	result := &models.WorkflowRun{
 		GitHubID:   run.GetID(),
 		RunNumber:  run.GetRunNumber(),
@@ -2201,20 +2368,16 @@ func (h *Handler) convertWorkflowJob(job *gh.WorkflowJob, runID int) *models.Wor
 	return result
 }
 
+// generateState returns 128 random bits as hex (OAuth state, WebSocket client IDs).
 func generateState() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
+// generateSessionID returns 256 random bits as hex.
 func generateSessionID() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	return hex.EncodeToString(b)
-}
-
-// isSecureRequest returns true when the connection is HTTPS, either directly
-// (r.TLS is non-nil) or via a TLS-terminating reverse proxy (X-Forwarded-Proto).
-func isSecureRequest(r *http.Request) bool {
-	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }

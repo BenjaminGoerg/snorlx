@@ -7,6 +7,8 @@ dist/
 build/
 bin/
 *.exe
+*.tsbuildinfo
+backend/server
 
 # Environment files
 .env

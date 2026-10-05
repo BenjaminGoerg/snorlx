@@ -31,7 +31,7 @@ A comprehensive, self-hosted dashboard that provides centralized visibility over
 # 1. Clone and install
 git clone https://github.com/banshee86vr/snorlx.git && cd snorlx && pnpm install
 
-# 2. Configure (edit .env with your GitHub credentials)
+# 2. Configure (edit .env with your GitHub OAuth credentials and a SESSION_SECRET)
 cp env.example .env
 
 # 3. Set STORAGE_MODE=memory in .env (default)
@@ -96,9 +96,6 @@ cp env.example .env
 Edit `.env` with your credentials:
 
 ```env
-# Development mode (skip GitHub OAuth validation)
-DEV_MODE=true
-
 # Storage Mode - Use memory for quick start (no database needed)
 STORAGE_MODE=memory
 
@@ -106,13 +103,15 @@ STORAGE_MODE=memory
 GITHUB_CLIENT_ID=your_oauth_client_id
 GITHUB_CLIENT_SECRET=your_oauth_client_secret
 
-# Session Security (generate with: openssl rand -base64 32)
+# Encrypts stored GitHub tokens (generate with: openssl rand -base64 32, minimum 32 characters)
 SESSION_SECRET=your_random_32_character_secret_string
 
-# URLs
+# URLs (the Vite dev server proxies /api and /ws to the backend)
 PORT=8080
 FRONTEND_URL=http://localhost:5173
 ```
+
+`DEV_MODE=true` only relaxes startup validation (placeholder secret, missing OAuth credentials); you still need real OAuth credentials to sign in.
 
 3. **Start the application**
 
@@ -138,7 +137,7 @@ pnpm run dev:frontend
 
 ### Option 2: Database Mode (Persistent Storage)
 
-For persistent data storage in production environments.
+For persistent data storage. In this mode the backend refuses to start when the database is unreachable instead of silently falling back to memory.
 
 #### Step 1: Install Dependencies
 
@@ -183,9 +182,6 @@ cp env.example .env
 Edit `.env`:
 
 ```env
-# Development mode
-DEV_MODE=true
-
 # Storage Mode - Use database for persistence
 STORAGE_MODE=database
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/snorlx?sslmode=disable
@@ -194,7 +190,7 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/snorlx?sslmode=disabl
 GITHUB_CLIENT_ID=your_oauth_client_id
 GITHUB_CLIENT_SECRET=your_oauth_client_secret
 
-# Session Security
+# Encrypts stored GitHub tokens (openssl rand -base64 32)
 SESSION_SECRET=your_random_32_character_secret_string
 
 # URLs
@@ -214,14 +210,15 @@ Access the dashboard at http://localhost:5173
 
 ## 🐳 Docker Compose Setup
 
-For production deployments with all services containerized.
+A production-like stack with all services containerized. The browser talks only to the frontend: nginx serves the SPA and proxies `/api` and `/ws` to the backend, so one origin, first-party cookies and a strict CSP.
 
 1. **Configure environment**
 
 ```bash
 cp env.example .env
-# Edit .env with your production settings
-# Make sure STORAGE_MODE=database for Docker
+# Set POSTGRES_PASSWORD, SESSION_SECRET, GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET.
+# Register the OAuth callback as http://localhost:5174/api/auth/callback.
+# Optional: ALLOWED_GITHUB_USERS / ALLOWED_GITHUB_ORGS to restrict who can sign in.
 ```
 
 2. **Start all services**
@@ -230,7 +227,7 @@ cp env.example .env
 docker compose up -d
 ```
 
-The dashboard will be available at http://localhost:5174 (frontend) and http://localhost:3001 (backend API)
+The dashboard is available at http://localhost:5174. The backend is not published on the host; it is reachable only through the frontend proxy, and the database listens on `127.0.0.1:5433` for local `psql` access.
 
 3. **View logs**
 
@@ -271,8 +268,8 @@ This project uses GitHub OAuth App for user authentication (simpler than GitHub 
 3. Fill in the details:
 
    - **Application name**: `Snorlx Dashboard` (or your preferred name)
-   - **Homepage URL**: `http://localhost:5173` (or your production URL)
-   - **Authorization callback URL**: `http://localhost:8080/api/auth/callback`
+   - **Homepage URL**: the value of `FRONTEND_URL` (`http://localhost:5173` in development)
+   - **Authorization callback URL**: `<FRONTEND_URL>/api/auth/callback` (`http://localhost:5173/api/auth/callback` in development; the frontend proxies `/api` to the backend)
 
 4. Click **Register application**
 
@@ -325,23 +322,28 @@ For real-time updates via webhooks, configure a webhook in your repository/organ
 
 #### Server Configuration
 
-| Variable         | Description                              | Default                 |
-| ---------------- | ---------------------------------------- | ----------------------- |
-| `PORT`           | Server port                              | `8080`                  |
-| `LOG_LEVEL`      | Logging level (debug, info, warn, error) | `info`                  |
-| `SESSION_SECRET` | Session encryption key                   | Required                |
-| `FRONTEND_URL`   | Frontend URL for CORS                    | `http://localhost:5173` |
-| `VITE_API_URL`   | Backend API URL for the frontend         | `http://localhost:8080` |
+| Variable              | Description                                                                                                           | Default                               |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| `PORT`                | Server port                                                                                                           | `8080`                                |
+| `LOG_LEVEL`           | Logging level (debug, info, warn, error)                                                                              | `info`                                |
+| `LOG_FORMAT`          | `json` for structured logs, anything else for console output                                                          | console                               |
+| `SESSION_SECRET`      | Derives the key that encrypts stored GitHub tokens. Required outside `DEV_MODE`, minimum 32 characters                | Required                              |
+| `FRONTEND_URL`        | Public origin (`scheme://host`) used for CORS, CSRF, WebSocket origin checks and the OAuth redirect. Plain `http` is accepted only for localhost outside `DEV_MODE` | `http://localhost:5173`               |
+| `COOKIE_SECURE`       | Force the `Secure` flag on auth cookies                                                                               | `true` when `FRONTEND_URL` is https   |
+| `TRUSTED_PROXY_CIDRS` | Comma-separated networks whose `X-Forwarded-For` / `X-Real-IP` are trusted (ingress, reverse proxy)                   | none (peer address is used)           |
+| `VITE_API_URL`        | Backend API URL baked into the frontend build. Leave empty: the frontend proxies `/api` and `/ws` same-origin         | empty                                 |
 
 #### GitHub OAuth Configuration
 
-| Variable                | Description                                              | Required                    |
-| ----------------------- | -------------------------------------------------------- | --------------------------- |
-| `GITHUB_CLIENT_ID`      | GitHub OAuth App Client ID                               | Yes                         |
-| `GITHUB_CLIENT_SECRET`  | GitHub OAuth App Client Secret                           | Yes                         |
-| `GITHUB_BASE_URL`       | Enterprise Server URL (`https://host` or `.../api/v3`)   | No (defaults to github.com) |
-| `GITHUB_WEBHOOK_SECRET` | Webhook signature secret                                 | No (for webhooks only)      |
-| `DEV_MODE`              | Skip GitHub OAuth validation                             | No                          |
+| Variable                | Description                                                                              | Required                    |
+| ----------------------- | ---------------------------------------------------------------------------------------- | --------------------------- |
+| `GITHUB_CLIENT_ID`      | GitHub OAuth App Client ID                                                               | Yes                         |
+| `GITHUB_CLIENT_SECRET`  | GitHub OAuth App Client Secret                                                           | Yes                         |
+| `GITHUB_BASE_URL`       | Enterprise Server URL (`https://host` or `.../api/v3`)                                   | No (defaults to github.com) |
+| `GITHUB_WEBHOOK_SECRET` | Webhook signature secret; unsigned deliveries are rejected                               | No (for webhooks only)      |
+| `ALLOWED_GITHUB_USERS`  | Comma-separated GitHub logins allowed to sign in                                         | No (recommended)            |
+| `ALLOWED_GITHUB_ORGS`   | Comma-separated GitHub organizations whose members may sign in                           | No (recommended)            |
+| `DEV_MODE`              | Relax startup validation (placeholder secret, missing OAuth credentials). Local dev only | No                          |
 
 #### Sync Configuration
 
@@ -354,7 +356,10 @@ For real-time updates via webhooks, configure a webhook in your repository/organ
 
 ### Health Check
 
-- `GET /health` - JSON `{"status":"ok","version":"<release>"}`. Probes use the HTTP status code.
+- `GET /health` - JSON `{"status":"ok","version":"<release>"}`. Liveness: process only.
+- `GET /health/ready` - `200 {"status":"ready"}` or `503 {"status":"unavailable"}`. Readiness: also pings the storage backend.
+
+All `/api` routes below (except `/api/auth/*` and the webhook receiver) require a session cookie or a personal API token, and every object is scoped to the repositories the caller synced. See [SECURITY.md](SECURITY.md) for the access model.
 
 ### Authentication
 
@@ -416,6 +421,7 @@ For real-time updates via webhooks, configure a webhook in your repository/organ
 ```
 ├── .github/workflows/      # CI and Security GitHub Actions
 ├── frontend/               # React frontend
+│   ├── nginx/              # nginx template (SPA + same-origin /api and /ws proxy)
 │   ├── src/
 │   │   ├── components/     # UI components (layout, protected routes)
 │   │   ├── context/        # React contexts (auth, theme, socket, sync, sidebar)
@@ -429,15 +435,17 @@ For real-time updates via webhooks, configure a webhook in your repository/organ
 ├── backend/                # Go backend
 │   ├── cmd/server/         # Main entry point
 │   ├── internal/
-│   │   ├── config/         # Configuration
-│   │   ├── database/       # Database migrations and setup
+│   │   ├── config/         # Configuration and validation
 │   │   ├── github/         # GitHub client
-│   │   ├── handlers/       # HTTP handlers
+│   │   ├── handlers/       # HTTP handlers (authn, per-user authz)
+│   │   ├── httpmiddleware/ # Trusted-proxy client IP, request logging
 │   │   ├── models/         # Data models
 │   │   ├── scorer/         # Repository scoring (gold/silver/bronze)
-│   │   ├── storage/        # Storage layer (memory/database)
-│   │   └── websocket/      # WebSocket hub for real-time updates
+│   │   ├── storage/        # Storage layer (memory/database) and migrations
+│   │   ├── tokencrypt/     # Encryption of stored GitHub tokens
+│   │   └── websocket/      # WebSocket hub for per-user real-time updates
 │   └── ...
+├── docs/adr/               # Architecture decision records
 ├── helm/                   # Kubernetes Helm charts
 └── docker-compose.yml      # Docker configuration
 ```
@@ -448,14 +456,28 @@ For real-time updates via webhooks, configure a webhook in your repository/organ
 
 **Backend won't start: GitHub OAuth credentials required**
 
-- Set `DEV_MODE=true` in your `.env` file for local development (skips OAuth)
-- Or provide `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` from a [GitHub OAuth App](#github-oauth-app-setup)
+- Provide `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` from a [GitHub OAuth App](#github-oauth-app-setup)
+- `DEV_MODE=true` lets the process start without them for local work on non-auth code, but nobody can sign in
+
+**Backend won't start: SESSION_SECRET or FRONTEND_URL rejected**
+
+- `SESSION_SECRET` must be a random value of at least 32 characters (`openssl rand -base64 32`)
+- `FRONTEND_URL` must be an origin such as `https://dash.example.com`; plain `http` is accepted only for localhost unless `DEV_MODE=true`
 
 **Database connection errors**
 
 - Verify PostgreSQL is running: `psql -U postgres -d snorlx`
 - Check `DATABASE_URL` in `.env` matches your database credentials
 - Ensure TimescaleDB extension is installed
+- In database mode the backend exits on a connection failure by design; `/health/ready` returns 503 when the database goes away later
+
+**Signed in but the dashboard is empty**
+
+- Each user sees only the repositories they synced with their own token. Click **Sync** once after signing in (and once after upgrading from a release before 1.1)
+
+**403 on every action or WebSocket disconnected**
+
+- The browser origin must equal `FRONTEND_URL`. Serve the SPA and the API from that origin (the frontend image proxies `/api` and `/ws`); do not point the browser at the backend port directly
 
 **Port already in use (EADDRINUSE)**
 
@@ -495,10 +517,12 @@ Runs on push to `main`. release-please opens or updates the release pull request
 Runs on push, pull requests to `main`, and weekly (Monday 08:00 UTC):
 
 - **CodeQL Analysis**: Static analysis for Go and JavaScript/TypeScript
-- **Trivy Scans**: Filesystem vulnerability scan plus Docker image scans for both backend and frontend
+- **Trivy Scans**: Filesystem vulnerability scan plus Docker image scans for both backend and frontend; fixable CRITICAL and HIGH findings fail the job
 - **Dependency Review**: Flags newly introduced vulnerable dependencies on PRs
-- **Go Security**: govulncheck and gosec for Go-specific vulnerabilities
+- **Go Security**: govulncheck and gosec (pinned versions) for Go-specific vulnerabilities
 - **npm Audit**: Checks for known vulnerabilities in Node packages
+
+All workflows pin actions to full commit SHAs and install dependencies with `--frozen-lockfile`; Dependabot keeps the pins, the image digests and the lockfile current. See [ADR 0006](docs/adr/0006-supply-chain-pinning-and-signing.md).
 
 ## 12-Factor App Compliance
 
@@ -530,10 +554,25 @@ docker pull ghcr.io/banshee86vr/snorlx-backend:X.Y.Z
 docker pull ghcr.io/banshee86vr/snorlx-frontend:X.Y.Z
 ```
 
-The Helm chart is an OCI artifact. An empty image tag in the chart uses `appVersion`, which matches the image tag.
+The Helm chart is an OCI artifact. An empty image tag in the chart uses `appVersion`, which matches the image tag. The chart needs the public dashboard origin: enable the ingress with TLS (the origin becomes `https://<first host>`) or set `backend.frontendUrl` explicitly, for example when TLS terminates in front of the ingress or for port-forward access. Generated secrets (database password, `SESSION_SECRET`) are created on first install and kept across upgrades.
 
 ```bash
-helm install snorlx oci://ghcr.io/banshee86vr/charts/snorlx --version X.Y.Z
+helm install snorlx oci://ghcr.io/banshee86vr/charts/snorlx --version X.Y.Z \
+  --set ingress.enabled=true \
+  --set 'ingress.hosts[0].host=snorlx.example.com' \
+  --set 'ingress.tls[0].secretName=snorlx-tls' \
+  --set 'ingress.tls[0].hosts[0]=snorlx.example.com' \
+  --set github.clientId=... --set github.clientSecret=... \
+  --set github.allowedOrgs=my-org
+```
+
+Images and the chart are signed with keyless cosign and carry SLSA provenance and an SBOM:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp 'https://github.com/banshee86vr/snorlx/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/banshee86vr/snorlx-backend:X.Y.Z
 ```
 
 release-please authenticates with a GitHub App. Create the app (Contents, Pull requests, and Issues write), install it on this repository, and store `RELEASE_PLEASE_APP_ID` and `RELEASE_PLEASE_APP_PRIVATE_KEY` as secrets. Enable immutable releases under Settings, General, Releases before the first release.

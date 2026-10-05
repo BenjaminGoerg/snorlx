@@ -15,7 +15,16 @@ async function main(): Promise<void> {
     const port = Number(process.env.MCP_PORT || process.env.PORT || 3100);
     const host = process.env.MCP_HOST?.trim() || '127.0.0.1';
     const httpToken = requireEnv('MCP_HTTP_TOKEN');
-    await startHttpServer({ client, port, host, httpToken });
+    const allowedHosts = process.env.MCP_ALLOWED_HOSTS?.trim() || undefined;
+    const ttlSeconds = Number(process.env.MCP_SESSION_TTL_SECONDS || 0);
+    await startHttpServer({
+      client,
+      port,
+      host,
+      httpToken,
+      allowedHosts,
+      sessionTtlMs: ttlSeconds > 0 ? ttlSeconds * 1000 : undefined,
+    });
     return;
   }
 

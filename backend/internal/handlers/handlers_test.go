@@ -23,25 +23,37 @@ import (
 type mockStorage struct {
 	getSessionFunc        func(ctx context.Context, sessionID string) (*models.Session, *models.User, error)
 	deleteSessionFunc     func(ctx context.Context, sessionID string) error
-	listOrgsFunc          func(ctx context.Context) ([]models.Organization, error)
-	getDashboardFunc      func(ctx context.Context) (*models.DashboardSummary, error)
-	getTrendsFunc         func(ctx context.Context, days int) ([]models.Trend, error)
+	listOrgsFunc          func(ctx context.Context, userID int) ([]models.Organization, error)
+	getDashboardFunc      func(ctx context.Context, userID int) (*models.DashboardSummary, error)
+	getTrendsFunc         func(ctx context.Context, userID, days int) ([]models.Trend, error)
 	getApiTokenByHashFunc func(ctx context.Context, tokenHash string) (*models.ApiToken, *models.User, error)
 	createApiTokenFunc    func(ctx context.Context, token *models.ApiToken) (*models.ApiToken, error)
 	listApiTokensFunc     func(ctx context.Context, userID int) ([]models.ApiToken, error)
 	revokeApiTokenFunc    func(ctx context.Context, userID, tokenID int) error
+	hasRepoAccessFunc     func(ctx context.Context, userID, repoID int) (bool, error)
+	getRepositoryFunc     func(ctx context.Context, id int) (*models.Repository, error)
+	getRunFunc            func(ctx context.Context, id int) (*models.WorkflowRun, error)
+	getWorkflowFunc       func(ctx context.Context, id int) (*models.Workflow, error)
+	listJobsForRunFunc    func(ctx context.Context, runID int) ([]models.WorkflowJob, error)
+	pingFunc              func(ctx context.Context) error
 }
 
 func (m *mockStorage) Close() error   { return nil }
 func (m *mockStorage) Migrate() error { return nil }
-func (m *mockStorage) ListOrganizations(ctx context.Context) ([]models.Organization, error) {
+func (m *mockStorage) Ping(ctx context.Context) error {
+	if m.pingFunc != nil {
+		return m.pingFunc(ctx)
+	}
+	return nil
+}
+func (m *mockStorage) ListOrganizations(ctx context.Context, userID int) ([]models.Organization, error) {
 	if m.listOrgsFunc != nil {
-		return m.listOrgsFunc(ctx)
+		return m.listOrgsFunc(ctx, userID)
 	}
 	return nil, nil
 }
-func (m *mockStorage) GetOrganization(ctx context.Context, id int) (*models.Organization, error) {
-	return nil, nil
+func (m *mockStorage) GetOrganization(ctx context.Context, userID, id int) (*models.Organization, error) {
+	return nil, errors.New("organization not found")
 }
 func (m *mockStorage) GetOrganizationByGitHubID(ctx context.Context, githubID int64) (*models.Organization, error) {
 	return nil, nil
@@ -49,10 +61,25 @@ func (m *mockStorage) GetOrganizationByGitHubID(ctx context.Context, githubID in
 func (m *mockStorage) UpsertOrganization(ctx context.Context, org *models.Organization) (*models.Organization, error) {
 	return org, nil
 }
-func (m *mockStorage) ListRepositories(ctx context.Context, page, pageSize int, search string) ([]models.Repository, int, error) {
+func (m *mockStorage) ListRepositories(ctx context.Context, userID, page, pageSize int, search string) ([]models.Repository, int, error) {
 	return nil, 0, nil
 }
 func (m *mockStorage) GetRepository(ctx context.Context, id int) (*models.Repository, error) {
+	if m.getRepositoryFunc != nil {
+		return m.getRepositoryFunc(ctx, id)
+	}
+	return nil, errors.New("repository not found")
+}
+func (m *mockStorage) GrantRepositoryAccess(ctx context.Context, userID, repoID int) error {
+	return nil
+}
+func (m *mockStorage) HasRepositoryAccess(ctx context.Context, userID, repoID int) (bool, error) {
+	if m.hasRepoAccessFunc != nil {
+		return m.hasRepoAccessFunc(ctx, userID, repoID)
+	}
+	return false, nil
+}
+func (m *mockStorage) ListUsersWithRepositoryAccess(ctx context.Context, repoID int) ([]int, error) {
 	return nil, nil
 }
 func (m *mockStorage) GetRepositoryByGitHubID(ctx context.Context, githubID int64) (*models.Repository, error) {
@@ -64,11 +91,14 @@ func (m *mockStorage) UpsertRepository(ctx context.Context, repo *models.Reposit
 func (m *mockStorage) UpdateRepository(ctx context.Context, id int, repo *models.Repository) (*models.Repository, error) {
 	return repo, nil
 }
-func (m *mockStorage) ListWorkflows(ctx context.Context, repoID *int) ([]models.Workflow, error) {
+func (m *mockStorage) ListWorkflows(ctx context.Context, userID int, repoID *int) ([]models.Workflow, error) {
 	return nil, nil
 }
 func (m *mockStorage) GetWorkflow(ctx context.Context, id int) (*models.Workflow, error) {
-	return nil, nil
+	if m.getWorkflowFunc != nil {
+		return m.getWorkflowFunc(ctx, id)
+	}
+	return nil, errors.New("workflow not found")
 }
 func (m *mockStorage) GetWorkflowByGitHubID(ctx context.Context, githubID int64) (*models.Workflow, error) {
 	return nil, nil
@@ -79,11 +109,14 @@ func (m *mockStorage) UpsertWorkflow(ctx context.Context, workflow *models.Workf
 func (m *mockStorage) UpdateWorkflow(ctx context.Context, id int, workflow *models.Workflow) (*models.Workflow, error) {
 	return workflow, nil
 }
-func (m *mockStorage) ListRuns(ctx context.Context, filters *models.RunFilters, page, pageSize int) ([]models.WorkflowRun, int, error) {
+func (m *mockStorage) ListRuns(ctx context.Context, userID int, filters *models.RunFilters, page, pageSize int) ([]models.WorkflowRun, int, error) {
 	return nil, 0, nil
 }
 func (m *mockStorage) GetRun(ctx context.Context, id int) (*models.WorkflowRun, error) {
-	return nil, nil
+	if m.getRunFunc != nil {
+		return m.getRunFunc(ctx, id)
+	}
+	return nil, errors.New("run not found")
 }
 func (m *mockStorage) GetRunByGitHubID(ctx context.Context, githubID int64) (*models.WorkflowRun, error) {
 	return nil, nil
@@ -92,6 +125,9 @@ func (m *mockStorage) UpsertRun(ctx context.Context, run *models.WorkflowRun) (*
 	return run, nil
 }
 func (m *mockStorage) ListJobsForRun(ctx context.Context, runID int) ([]models.WorkflowJob, error) {
+	if m.listJobsForRunFunc != nil {
+		return m.listJobsForRunFunc(ctx, runID)
+	}
 	return nil, nil
 }
 func (m *mockStorage) GetJob(ctx context.Context, id int) (*models.WorkflowJob, error) {
@@ -163,23 +199,23 @@ func (m *mockStorage) RevokeApiToken(ctx context.Context, userID, tokenID int) e
 func (m *mockStorage) TouchApiTokenLastUsed(ctx context.Context, tokenID int) error {
 	return nil
 }
-func (m *mockStorage) GetDashboardSummary(ctx context.Context) (*models.DashboardSummary, error) {
+func (m *mockStorage) GetDashboardSummary(ctx context.Context, userID int) (*models.DashboardSummary, error) {
 	if m.getDashboardFunc != nil {
-		return m.getDashboardFunc(ctx)
+		return m.getDashboardFunc(ctx, userID)
 	}
 	return &models.DashboardSummary{}, nil
 }
-func (m *mockStorage) GetTrends(ctx context.Context, days int) ([]models.Trend, error) {
+func (m *mockStorage) GetTrends(ctx context.Context, userID, days int) ([]models.Trend, error) {
 	if m.getTrendsFunc != nil {
-		return m.getTrendsFunc(ctx, days)
+		return m.getTrendsFunc(ctx, userID, days)
 	}
 	return nil, nil
 }
 
-func (m *mockStorage) BackfillDeploymentRuns(ctx context.Context) (int, error) {
+func (m *mockStorage) BackfillDeploymentRuns(ctx context.Context, userID int) (int, error) {
 	return 0, nil
 }
-func (m *mockStorage) ListActivePipelines(ctx context.Context) ([]models.WorkflowRun, error) {
+func (m *mockStorage) ListActivePipelines(ctx context.Context, userID int) ([]models.WorkflowRun, error) {
 	return nil, nil
 }
 func (m *mockStorage) UpsertRepositoryScore(ctx context.Context, score *models.RepositoryScore) (*models.RepositoryScore, error) {
@@ -188,7 +224,7 @@ func (m *mockStorage) UpsertRepositoryScore(ctx context.Context, score *models.R
 func (m *mockStorage) GetLatestRepositoryScore(ctx context.Context, repoID int) (*models.RepositoryScore, error) {
 	return nil, nil
 }
-func (m *mockStorage) ListLatestRepositoryScores(ctx context.Context) ([]models.RepositoryScore, error) {
+func (m *mockStorage) ListLatestRepositoryScores(ctx context.Context, userID int) ([]models.RepositoryScore, error) {
 	return nil, nil
 }
 
@@ -205,6 +241,18 @@ func newTestHandler(store *mockStorage) *Handler {
 		storage: store,
 		// ghClient, wsHub, scorer are nil; only test handlers that don't use them
 	}
+}
+
+// withUser returns req with user attached as the authenticated principal.
+func withUser(req *http.Request, user *models.User) *http.Request {
+	return req.WithContext(context.WithValue(req.Context(), userContextKey, user))
+}
+
+// withURLParam returns req with a chi route parameter set.
+func withURLParam(req *http.Request, key, value string) *http.Request {
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add(key, value)
+	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 }
 
 // ===== AuthStatus =====
@@ -557,8 +605,11 @@ func TestCreateAndListAndRevokeApiToken(t *testing.T) {
 // ===== GetDashboardSummary =====
 
 func TestGetDashboardSummary_ReturnsJSON(t *testing.T) {
+	user := &models.User{ID: 42, Login: "alice"}
+	var seenUser int
 	store := &mockStorage{
-		getDashboardFunc: func(ctx context.Context) (*models.DashboardSummary, error) {
+		getDashboardFunc: func(ctx context.Context, userID int) (*models.DashboardSummary, error) {
+			seenUser = userID
 			return &models.DashboardSummary{
 				Repositories: models.RepositorySummary{Total: 5, Active: 4},
 				Workflows:    models.WorkflowSummary{Total: 10, Active: 8},
@@ -567,13 +618,16 @@ func TestGetDashboardSummary_ReturnsJSON(t *testing.T) {
 	}
 	h := newTestHandler(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/dashboard/summary", nil)
+	req := withUser(httptest.NewRequest(http.MethodGet, "/api/dashboard/summary", nil), user)
 	rec := httptest.NewRecorder()
 
 	h.GetDashboardSummary(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", rec.Code)
+	}
+	if seenUser != user.ID {
+		t.Errorf("summary must be scoped to the caller, got user %d", seenUser)
 	}
 
 	var resp models.DashboardSummary
@@ -585,32 +639,253 @@ func TestGetDashboardSummary_ReturnsJSON(t *testing.T) {
 	}
 }
 
-// ===== Helper functions =====
-
-func TestIsSecureRequest_TLS(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-	// httptest doesn't set TLS, so test via X-Forwarded-Proto
-	req.Header.Set("X-Forwarded-Proto", "https")
-
-	if !isSecureRequest(req) {
-		t.Error("expected isSecureRequest=true for X-Forwarded-Proto: https")
+func TestGetDashboardSummary_NoUser_Unauthorized(t *testing.T) {
+	h := newTestHandler(&mockStorage{})
+	rec := httptest.NewRecorder()
+	h.GetDashboardSummary(rec, httptest.NewRequest(http.MethodGet, "/api/dashboard/summary", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 without user, got %d", rec.Code)
 	}
 }
 
-func TestIsSecureRequest_HTTP(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+func TestGetTrends_CapsDays(t *testing.T) {
+	var seenDays int
+	store := &mockStorage{
+		getTrendsFunc: func(ctx context.Context, userID, days int) ([]models.Trend, error) {
+			seenDays = days
+			return nil, nil
+		},
+	}
+	h := newTestHandler(store)
 
-	if isSecureRequest(req) {
-		t.Error("expected isSecureRequest=false for plain HTTP without TLS")
+	req := withUser(httptest.NewRequest(http.MethodGet, "/api/dashboard/trends?days=99999999", nil), &models.User{ID: 1})
+	rec := httptest.NewRecorder()
+	h.GetTrends(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if seenDays != maxTrendDays {
+		t.Errorf("days must be capped at %d, got %d", maxTrendDays, seenDays)
+	}
+	if !strings.Contains(rec.Body.String(), `"trends":[]`) {
+		t.Errorf("empty trends must serialize as an array, got %s", rec.Body.String())
 	}
 }
 
-func TestIsSecureRequest_ForwardedProto_CaseInsensitive(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("X-Forwarded-Proto", "HTTPS")
+// ===== Repository access =====
 
-	if !isSecureRequest(req) {
-		t.Error("expected isSecureRequest=true for uppercase HTTPS in X-Forwarded-Proto")
+func TestGetRun_OtherUsersRepository_NotFound(t *testing.T) {
+	store := &mockStorage{
+		getRunFunc: func(ctx context.Context, id int) (*models.WorkflowRun, error) {
+			return &models.WorkflowRun{ID: id, RepoID: 7}, nil
+		},
+		hasRepoAccessFunc: func(ctx context.Context, userID, repoID int) (bool, error) {
+			return userID == 1 && repoID == 7, nil
+		},
+	}
+	h := newTestHandler(store)
+
+	// Owner sees the run
+	req := withURLParam(withUser(httptest.NewRequest(http.MethodGet, "/api/runs/5", nil), &models.User{ID: 1}), "id", "5")
+	rec := httptest.NewRecorder()
+	h.GetRun(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner expected 200, got %d", rec.Code)
+	}
+
+	// Another user gets the same answer as for a missing run
+	req = withURLParam(withUser(httptest.NewRequest(http.MethodGet, "/api/runs/5", nil), &models.User{ID: 2}), "id", "5")
+	rec = httptest.NewRecorder()
+	h.GetRun(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("other user expected 404, got %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "7") {
+		t.Errorf("response must not leak repository details: %s", rec.Body.String())
+	}
+}
+
+func TestGetRunJobs_CachedJobsRequireAccess(t *testing.T) {
+	store := &mockStorage{
+		getRunFunc: func(ctx context.Context, id int) (*models.WorkflowRun, error) {
+			return &models.WorkflowRun{ID: id, RepoID: 7}, nil
+		},
+		hasRepoAccessFunc: func(ctx context.Context, userID, repoID int) (bool, error) {
+			return false, nil
+		},
+		listJobsForRunFunc: func(ctx context.Context, runID int) ([]models.WorkflowJob, error) {
+			return []models.WorkflowJob{{ID: 1, Name: "secret-job"}}, nil
+		},
+	}
+	h := newTestHandler(store)
+
+	req := withURLParam(withUser(httptest.NewRequest(http.MethodGet, "/api/runs/5/jobs", nil), &models.User{ID: 2}), "id", "5")
+	rec := httptest.NewRecorder()
+	h.GetRunJobs(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "secret-job") {
+		t.Error("cached jobs leaked to a user without access")
+	}
+}
+
+func TestGetWorkflow_AccessCheckUsesWorkflowRepo(t *testing.T) {
+	store := &mockStorage{
+		getWorkflowFunc: func(ctx context.Context, id int) (*models.Workflow, error) {
+			return &models.Workflow{ID: id, RepoID: 3, Name: "CI"}, nil
+		},
+		hasRepoAccessFunc: func(ctx context.Context, userID, repoID int) (bool, error) {
+			return repoID == 3 && userID == 9, nil
+		},
+	}
+	h := newTestHandler(store)
+
+	req := withURLParam(withUser(httptest.NewRequest(http.MethodGet, "/api/workflows/1", nil), &models.User{ID: 9}), "id", "1")
+	rec := httptest.NewRecorder()
+	h.GetWorkflow(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	req = withURLParam(withUser(httptest.NewRequest(http.MethodGet, "/api/workflows/1", nil), &models.User{ID: 10}), "id", "1")
+	rec = httptest.NewRecorder()
+	h.GetWorkflow(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+}
+
+func TestGetRepository_UnknownUser_Unauthorized(t *testing.T) {
+	h := newTestHandler(&mockStorage{})
+	req := withURLParam(httptest.NewRequest(http.MethodGet, "/api/repositories/1", nil), "id", "1")
+	rec := httptest.NewRecorder()
+	h.GetRepository(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+}
+
+// ===== Cookies =====
+
+func TestSessionCookieName_FollowsSecureFlag(t *testing.T) {
+	h := newTestHandler(&mockStorage{})
+	if got := h.sessionCookieName(); got != sessionCookieInsecureName {
+		t.Errorf("insecure config: cookie name = %q", got)
+	}
+	h.config.CookieSecure = true
+	if got := h.sessionCookieName(); got != sessionCookieSecureName {
+		t.Errorf("secure config: cookie name = %q", got)
+	}
+	c := h.authCookie(h.sessionCookieName(), "v", 0, time.Now().Add(time.Hour))
+	if !c.Secure || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/" || c.Domain != "" {
+		t.Errorf("secure cookie attributes wrong: %+v", c)
+	}
+}
+
+func TestAuthMiddleware_SecureMode_IgnoresInsecureCookieName(t *testing.T) {
+	user := &models.User{ID: 1, Login: "octocat"}
+	store := &mockStorage{
+		getSessionFunc: func(ctx context.Context, sessionID string) (*models.Session, *models.User, error) {
+			return &models.Session{ID: sessionID, UserID: 1}, user, nil
+		},
+	}
+	h := newTestHandler(store)
+	h.config.CookieSecure = true
+
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true })
+
+	req := httptest.NewRequest(http.MethodGet, "/api/protected", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecureName, Value: "sess"})
+	rec := httptest.NewRecorder()
+	h.AuthMiddleware(next).ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized || called {
+		t.Fatalf("plain 'session' cookie must be ignored in secure mode: status=%d called=%v", rec.Code, called)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/protected", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieSecureName, Value: "sess"})
+	rec = httptest.NewRecorder()
+	h.AuthMiddleware(next).ServeHTTP(rec, req)
+	if !called {
+		t.Fatalf("__Host-session cookie must authenticate: status=%d", rec.Code)
+	}
+}
+
+// ===== Login allowlist =====
+
+func TestIsLoginAllowed_NoAllowlist_AllowsEveryone(t *testing.T) {
+	h := newTestHandler(&mockStorage{})
+	allowed, err := h.isLoginAllowed(context.Background(), nil, "anyone")
+	if err != nil || !allowed {
+		t.Fatalf("expected allowed without allowlist, got %v %v", allowed, err)
+	}
+}
+
+func TestIsLoginAllowed_UserAllowlist(t *testing.T) {
+	h := newTestHandler(&mockStorage{})
+	h.config.AllowedGitHubUsers = []string{"Alice", "bob"}
+
+	for login, want := range map[string]bool{"alice": true, "BOB": true, "mallory": false} {
+		allowed, err := h.isLoginAllowed(context.Background(), nil, login)
+		if err != nil {
+			t.Fatalf("%s: %v", login, err)
+		}
+		if allowed != want {
+			t.Errorf("isLoginAllowed(%q) = %v, want %v", login, allowed, want)
+		}
+	}
+}
+
+// ===== Reusable workflow references =====
+
+func TestParseReusableWorkflowRef(t *testing.T) {
+	local, ok := parseReusableWorkflowRef("./.github/workflows/build.yml", "me", "repo", "abc123")
+	if !ok || !local.isLocal || local.owner != "me" || local.repo != "repo" || local.path != ".github/workflows/build.yml" || local.ref != "abc123" {
+		t.Fatalf("local ref parsed wrong: %+v ok=%v", local, ok)
+	}
+
+	ext, ok := parseReusableWorkflowRef("octo-org/shared/.github/workflows/ci.yaml@v1.2", "me", "repo", "abc")
+	if !ok || ext.isLocal || ext.owner != "octo-org" || ext.repo != "shared" || ext.path != ".github/workflows/ci.yaml" || ext.ref != "v1.2" {
+		t.Fatalf("external ref parsed wrong: %+v ok=%v", ext, ok)
+	}
+
+	noRef, ok := parseReusableWorkflowRef("octo-org/shared/.github/workflows/ci.yml", "me", "repo", "abc")
+	if !ok || noRef.ref != "main" {
+		t.Fatalf("missing ref must default to main: %+v ok=%v", noRef, ok)
+	}
+
+	for _, bad := range []string{
+		"./../../etc/passwd",
+		"./.github/workflows/../../secrets.yml",
+		"octo-org/shared/src/not-a-workflow.yml@main",
+		"octo-org/shared/.github/workflows/ci.yml@../other",
+		"octo org/shared/.github/workflows/ci.yml@main",
+		"octo-org/shared/.github/workflows/ci.yml?x=1@main",
+		"docker://alpine",
+		"",
+	} {
+		if _, ok := parseReusableWorkflowRef(bad, "me", "repo", "abc"); ok {
+			t.Errorf("expected %q to be rejected", bad)
+		}
+	}
+}
+
+func TestReady(t *testing.T) {
+	h := newTestHandler(&mockStorage{})
+	rec := httptest.NewRecorder()
+	h.Ready(rec, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 when storage answers, got %d", rec.Code)
+	}
+
+	h = newTestHandler(&mockStorage{pingFunc: func(ctx context.Context) error { return errors.New("db down") }})
+	rec = httptest.NewRecorder()
+	h.Ready(rec, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when storage is down, got %d", rec.Code)
 	}
 }
 

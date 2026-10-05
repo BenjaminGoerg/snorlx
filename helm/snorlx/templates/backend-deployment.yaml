@@ -6,7 +6,9 @@ metadata:
     {{- include "snorlx.labels" . | nindent 4 }}
     app.kubernetes.io/component: backend
 spec:
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.backend.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "snorlx.backend.selectorLabels" . | nindent 6 }}
@@ -14,12 +16,15 @@ spec:
     metadata:
       labels:
         {{- include "snorlx.backend.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "snorlx.serviceAccountName" . }}
+      automountServiceAccountToken: false
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -37,46 +42,46 @@ spec:
               value: "{{ .Values.backend.port }}"
             - name: LOG_LEVEL
               value: "{{ .Values.backend.env.LOG_LEVEL }}"
+            - name: LOG_FORMAT
+              value: "{{ .Values.backend.env.LOG_FORMAT }}"
+            - name: STORAGE_MODE
+              value: database
             - name: FRONTEND_URL
-              value: "http://{{ include "snorlx.fullname" . }}-frontend"
+              value: {{ include "snorlx.frontendUrl" . | quote }}
+            - name: TRUSTED_PROXY_CIDRS
+              value: {{ .Values.backend.trustedProxyCidrs | quote }}
+            - name: ALLOWED_GITHUB_USERS
+              value: {{ .Values.github.allowedUsers | quote }}
+            - name: ALLOWED_GITHUB_ORGS
+              value: {{ .Values.github.allowedOrgs | quote }}
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "snorlx.fullname" . }}-secrets
+                  name: {{ include "snorlx.secretName" . }}
                   key: postgres-password
             - name: DATABASE_URL
               value: {{ include "snorlx.databaseUrl" . | quote }}
-            - name: GITHUB_APP_ID
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "snorlx.fullname" . }}-secrets
-                  key: github-app-id
             - name: GITHUB_CLIENT_ID
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "snorlx.fullname" . }}-secrets
+                  name: {{ include "snorlx.secretName" . }}
                   key: github-client-id
             - name: GITHUB_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "snorlx.fullname" . }}-secrets
+                  name: {{ include "snorlx.secretName" . }}
                   key: github-client-secret
             - name: GITHUB_BASE_URL
               value: {{ .Values.github.baseUrl | quote }}
-            - name: GITHUB_PRIVATE_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "snorlx.fullname" . }}-secrets
-                  key: github-private-key
             - name: GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "snorlx.fullname" . }}-secrets
+                  name: {{ include "snorlx.secretName" . }}
                   key: github-webhook-secret
             - name: SESSION_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "snorlx.fullname" . }}-secrets
+                  name: {{ include "snorlx.secretName" . }}
                   key: session-secret
           livenessProbe:
             httpGet:
@@ -86,7 +91,7 @@ spec:
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /health
+              path: /health/ready
               port: http
             initialDelaySeconds: 5
             periodSeconds: 5
@@ -104,4 +109,3 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-

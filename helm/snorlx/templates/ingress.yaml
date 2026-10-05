@@ -28,8 +28,16 @@ spec:
     - host: {{ .host | quote }}
       http:
         paths:
+          # API and WebSocket go straight to the backend; everything else is the SPA.
           - path: /api
             pathType: Prefix
+            backend:
+              service:
+                name: {{ include "snorlx.fullname" $ }}-backend
+                port:
+                  number: {{ $.Values.service.backend.port }}
+          - path: /ws
+            pathType: Exact
             backend:
               service:
                 name: {{ include "snorlx.fullname" $ }}-backend
@@ -44,4 +52,3 @@ spec:
                   number: {{ $.Values.service.frontend.port }}
     {{- end }}
 {{- end }}
-

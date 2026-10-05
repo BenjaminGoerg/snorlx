@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# Actions are pinned to full commit SHAs (tag in the trailing comment). Dependabot keeps them current.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -24,16 +28,19 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
 
       - name: Verify dependencies
         run: go mod verify
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l ./cmd ./internal)"
 
       - name: Run go vet
         run: go vet ./...
@@ -46,7 +53,7 @@ jobs:
 
       - name: Upload coverage report
         if: success()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: backend-coverage
           path: backend/coverage.out
@@ -68,35 +75,32 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - name: Get pnpm store directory
         id: pnpm-cache
         run: echo "store=$(pnpm store path)" >> $GITHUB_OUTPUT
 
       - name: Cache pnpm store
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.pnpm-cache.outputs.store }}
           key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
           restore-keys: |
             ${{ runner.os }}-pnpm-
 
+      # The lockfile is the supply-chain contract: a mismatch fails the build instead of being
+      # silently re-resolved. The lockfile-update workflow keeps bot PRs in sync.
       - name: Install dependencies
-        run: |
-          pnpm install --frozen-lockfile || {
-            echo "Frozen install failed, regenerating lockfile for this CI run..."
-            rm -f pnpm-lock.yaml
-            pnpm install --no-frozen-lockfile
-          }
+        run: pnpm install --frozen-lockfile
         working-directory: .
 
       - name: Lint
@@ -109,7 +113,7 @@ jobs:
 
       - name: Upload coverage report
         if: success()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: frontend-coverage
           path: frontend/coverage/
@@ -122,6 +126,10 @@ jobs:
         env:
           VITE_API_URL: ""
 
+      - name: Build MCP server
+        run: pnpm mcp:build
+        working-directory: .
+
   # ─────────────────────────────────────────────────────────────
   # Helm: lint and render, including the appVersion image fallback
   # ─────────────────────────────────────────────────────────────
@@ -131,17 +139,42 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Lint chart
-        run: helm lint helm/snorlx
+        run: helm lint helm/snorlx --set backend.frontendUrl=https://snorlx.example.com
 
       - name: Render chart
         run: |
+          set -euo pipefail
           app_version=$(awk '/^appVersion:/ { gsub(/"/, "", $2); print $2 }' helm/snorlx/Chart.yaml)
-          helm template snorlx helm/snorlx > /tmp/snorlx.yaml
+          base_args="--set backend.frontendUrl=https://snorlx.example.com"
+          helm template snorlx helm/snorlx $base_args > /tmp/snorlx.yaml
           grep -q "ghcr.io/banshee86vr/snorlx-backend:${app_version}" /tmp/snorlx.yaml
           grep -q "ghcr.io/banshee86vr/snorlx-frontend:${app_version}" /tmp/snorlx.yaml
-          helm template snorlx helm/snorlx --set image.backend.tag=9.9.9 --set image.frontend.tag=9.9.9 > /tmp/snorlx-override.yaml
+          helm template snorlx helm/snorlx $base_args --set image.backend.tag=9.9.9 --set image.frontend.tag=9.9.9 > /tmp/snorlx-override.yaml
           grep -q 'ghcr.io/banshee86vr/snorlx-backend:9.9.9' /tmp/snorlx-override.yaml
           grep -q 'ghcr.io/banshee86vr/snorlx-frontend:9.9.9' /tmp/snorlx-override.yaml
+          # Every optional resource renders, and the public origin is derived from the ingress host
+          helm template snorlx helm/snorlx \
+            --set ingress.enabled=true \
+            --set 'ingress.hosts[0].host=dash.example.com' \
+            --set 'ingress.tls[0].secretName=snorlx-tls' \
+            --set 'ingress.tls[0].hosts[0]=dash.example.com' \
+            --set networkPolicy.enabled=true \
+            --set autoscaling.enabled=true \
+            --set podDisruptionBudget.enabled=true > /tmp/snorlx-full.yaml
+          grep -q 'value: "https://dash.example.com"' /tmp/snorlx-full.yaml
+          grep -q 'kind: NetworkPolicy' /tmp/snorlx-full.yaml
+          grep -q 'kind: HorizontalPodAutoscaler' /tmp/snorlx-full.yaml
+          grep -q 'kind: PodDisruptionBudget' /tmp/snorlx-full.yaml
+          # Rendering without a public origin must fail instead of producing a broken deployment
+          if helm template snorlx helm/snorlx > /dev/null 2>&1; then
+            echo "chart rendered without backend.frontendUrl or ingress" >&2
+            exit 1
+          fi
+          # An ingress without TLS would derive a plain-http origin the backend rejects
+          if helm template snorlx helm/snorlx --set ingress.enabled=true --set 'ingress.hosts[0].host=dash.example.com' > /dev/null 2>&1; then
+            echo "chart rendered an ingress without TLS and without backend.frontendUrl" >&2
+            exit 1
+          fi

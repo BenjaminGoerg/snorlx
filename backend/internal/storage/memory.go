@@ -19,28 +19,31 @@ type MemoryStorage struct {
 	mu sync.RWMutex
 
 	// Auto-increment IDs
-	orgIDCounter    int32
-	repoIDCounter   int32
+	orgIDCounter      int32
+	repoIDCounter     int32
 	workflowIDCounter int32
-	runIDCounter    int32
-	jobIDCounter    int32
-	deployIDCounter  int32
-	userIDCounter    int32
-	scoreIDCounter   int32
+	runIDCounter      int32
+	jobIDCounter      int32
+	deployIDCounter   int32
+	userIDCounter     int32
+	scoreIDCounter    int32
 	apiTokenIDCounter int32
 
 	// Data stores
-	organizations map[int]*models.Organization
-	repositories  map[int]*models.Repository
-	workflows     map[int]*models.Workflow
-	runs          map[int]*models.WorkflowRun
-	jobs          map[int]*models.WorkflowJob
-	deployments      map[int]*models.Deployment
-	users            map[int]*models.User
-	sessions         map[string]*models.Session
-	repositoryScores map[int]*models.RepositoryScore
-	apiTokens        map[int]*models.ApiToken
+	organizations     map[int]*models.Organization
+	repositories      map[int]*models.Repository
+	workflows         map[int]*models.Workflow
+	runs              map[int]*models.WorkflowRun
+	jobs              map[int]*models.WorkflowJob
+	deployments       map[int]*models.Deployment
+	users             map[int]*models.User
+	sessions          map[string]*models.Session
+	repositoryScores  map[int]*models.RepositoryScore
+	apiTokens         map[int]*models.ApiToken
 	apiTokenHashIndex map[string]int
+
+	// userRepos records which repositories each user may see: userID -> set of repo IDs.
+	userRepos map[int]map[int]bool
 
 	// GitHub ID indexes for fast lookups
 	orgGitHubIndex      map[int64]int
@@ -65,6 +68,7 @@ func NewMemoryStorage() *MemoryStorage {
 		repositoryScores:    make(map[int]*models.RepositoryScore),
 		apiTokens:           make(map[int]*models.ApiToken),
 		apiTokenHashIndex:   make(map[string]int),
+		userRepos:           make(map[int]map[int]bool),
 		orgGitHubIndex:      make(map[int64]int),
 		repoGitHubIndex:     make(map[int64]int),
 		workflowGitHubIndex: make(map[int64]int),
@@ -84,14 +88,77 @@ func (m *MemoryStorage) Migrate() error {
 	return nil
 }
 
+// Ping implements Storage interface (memory is always reachable)
+func (m *MemoryStorage) Ping(ctx context.Context) error {
+	return nil
+}
+
+// ===== Repository access (tenancy) =====
+
+// canAccess reports whether userID may see repoID. Caller must hold m.mu.
+func (m *MemoryStorage) canAccess(userID, repoID int) bool {
+	return m.userRepos[userID][repoID]
+}
+
+// canAccessOrg reports whether userID may see at least one repository of orgID. Caller must hold m.mu.
+func (m *MemoryStorage) canAccessOrg(userID, orgID int) bool {
+	for repoID := range m.userRepos[userID] {
+		repo, ok := m.repositories[repoID]
+		if ok && repo.OrgID != nil && *repo.OrgID == orgID {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *MemoryStorage) GrantRepositoryAccess(ctx context.Context, userID, repoID int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.repositories[repoID]; !ok {
+		return errors.New("repository not found")
+	}
+	if _, ok := m.users[userID]; !ok {
+		return errors.New("user not found")
+	}
+	if m.userRepos[userID] == nil {
+		m.userRepos[userID] = make(map[int]bool)
+	}
+	m.userRepos[userID][repoID] = true
+	return nil
+}
+
+func (m *MemoryStorage) HasRepositoryAccess(ctx context.Context, userID, repoID int) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.canAccess(userID, repoID), nil
+}
+
+func (m *MemoryStorage) ListUsersWithRepositoryAccess(ctx context.Context, repoID int) ([]int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var users []int
+	for userID, repos := range m.userRepos {
+		if repos[repoID] {
+			users = append(users, userID)
+		}
+	}
+	sort.Ints(users)
+	return users, nil
+}
+
 // ===== Organizations =====
 
-func (m *MemoryStorage) ListOrganizations(ctx context.Context) ([]models.Organization, error) {
+func (m *MemoryStorage) ListOrganizations(ctx context.Context, userID int) ([]models.Organization, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	orgs := make([]models.Organization, 0, len(m.organizations))
 	for _, org := range m.organizations {
+		if !m.canAccessOrg(userID, org.ID) {
+			continue
+		}
 		orgs = append(orgs, *org)
 	}
 
@@ -103,12 +170,12 @@ func (m *MemoryStorage) ListOrganizations(ctx context.Context) ([]models.Organiz
 	return orgs, nil
 }
 
-func (m *MemoryStorage) GetOrganization(ctx context.Context, id int) (*models.Organization, error) {
+func (m *MemoryStorage) GetOrganization(ctx context.Context, userID, id int) (*models.Organization, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	org, ok := m.organizations[id]
-	if !ok {
+	if !ok || !m.canAccessOrg(userID, id) {
 		return nil, errors.New("organization not found")
 	}
 	return org, nil
@@ -153,17 +220,17 @@ func (m *MemoryStorage) UpsertOrganization(ctx context.Context, org *models.Orga
 
 // ===== Repositories =====
 
-func (m *MemoryStorage) ListRepositories(ctx context.Context, page, pageSize int, search string) ([]models.Repository, int, error) {
+func (m *MemoryStorage) ListRepositories(ctx context.Context, userID, page, pageSize int, search string) ([]models.Repository, int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	// Normalize search query
 	searchLower := strings.ToLower(strings.TrimSpace(search))
 
-	// Filter active repos and apply search
+	// Filter active, accessible repos and apply search
 	var repos []models.Repository
 	for _, repo := range m.repositories {
-		if repo.IsActive {
+		if repo.IsActive && m.canAccess(userID, repo.ID) {
 			// Apply search filter if provided
 			if searchLower != "" {
 				nameLower := strings.ToLower(repo.Name)
@@ -282,13 +349,16 @@ func (m *MemoryStorage) UpdateRepository(ctx context.Context, id int, repo *mode
 
 // ===== Workflows =====
 
-func (m *MemoryStorage) ListWorkflows(ctx context.Context, repoID *int) ([]models.Workflow, error) {
+func (m *MemoryStorage) ListWorkflows(ctx context.Context, userID int, repoID *int) ([]models.Workflow, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var workflows []models.Workflow
 	for _, wf := range m.workflows {
 		if repoID != nil && wf.RepoID != *repoID {
+			continue
+		}
+		if !m.canAccess(userID, wf.RepoID) {
 			continue
 		}
 
@@ -459,12 +529,15 @@ func (m *MemoryStorage) UpdateWorkflow(ctx context.Context, id int, workflow *mo
 
 // ===== Workflow Runs =====
 
-func (m *MemoryStorage) ListRuns(ctx context.Context, filters *models.RunFilters, page, pageSize int) ([]models.WorkflowRun, int, error) {
+func (m *MemoryStorage) ListRuns(ctx context.Context, userID int, filters *models.RunFilters, page, pageSize int) ([]models.WorkflowRun, int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var runs []models.WorkflowRun
 	for _, run := range m.runs {
+		if !m.canAccess(userID, run.RepoID) {
+			continue
+		}
 		// Apply filters
 		if filters != nil {
 			if filters.WorkflowID != 0 && run.WorkflowID != filters.WorkflowID {
@@ -521,13 +594,16 @@ func (m *MemoryStorage) ListRuns(ctx context.Context, filters *models.RunFilters
 	return runs[offset:end], total, nil
 }
 
-func (m *MemoryStorage) ListActivePipelines(ctx context.Context) ([]models.WorkflowRun, error) {
+func (m *MemoryStorage) ListActivePipelines(ctx context.Context, userID int) ([]models.WorkflowRun, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var runs []models.WorkflowRun
 	for _, run := range m.runs {
 		if run.Status != "in_progress" && run.Status != "queued" {
+			continue
+		}
+		if !m.canAccess(userID, run.RepoID) {
 			continue
 		}
 		runCopy := *run
@@ -907,7 +983,7 @@ func (m *MemoryStorage) TouchApiTokenLastUsed(ctx context.Context, tokenID int) 
 
 // ===== Dashboard & Metrics =====
 
-func (m *MemoryStorage) GetDashboardSummary(ctx context.Context) (*models.DashboardSummary, error) {
+func (m *MemoryStorage) GetDashboardSummary(ctx context.Context, userID int) (*models.DashboardSummary, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -915,6 +991,9 @@ func (m *MemoryStorage) GetDashboardSummary(ctx context.Context) (*models.Dashbo
 
 	// Repository stats
 	for _, repo := range m.repositories {
+		if !m.canAccess(userID, repo.ID) {
+			continue
+		}
 		summary.Repositories.Total++
 		if repo.IsActive {
 			summary.Repositories.Active++
@@ -925,6 +1004,9 @@ func (m *MemoryStorage) GetDashboardSummary(ctx context.Context) (*models.Dashbo
 
 	// Workflow stats
 	for _, wf := range m.workflows {
+		if !m.canAccess(userID, wf.RepoID) {
+			continue
+		}
 		summary.Workflows.Total++
 		if strings.ToLower(wf.State) == "active" {
 			summary.Workflows.Active++
@@ -935,30 +1017,19 @@ func (m *MemoryStorage) GetDashboardSummary(ctx context.Context) (*models.Dashbo
 
 	// Calculate date ranges for current and previous periods (last 30 days and 30-60 days ago)
 	now := time.Now()
-	currentPeriodStart := now.AddDate(0, 0, -30) // 30 days ago
+	currentPeriodStart := now.AddDate(0, 0, -30)  // 30 days ago
 	previousPeriodStart := now.AddDate(0, 0, -60) // 60 days ago
 	previousPeriodEnd := currentPeriodStart
 
-	// Debug logging
-	totalRuns := len(m.runs)
-	var minDate, maxDate time.Time
+	// Only runs of repositories the user may see
+	var visibleRuns []*models.WorkflowRun
 	for _, run := range m.runs {
-		if minDate.IsZero() || run.StartedAt.Before(minDate) {
-			minDate = run.StartedAt
-		}
-		if maxDate.IsZero() || run.StartedAt.After(maxDate) {
-			maxDate = run.StartedAt
+		if m.canAccess(userID, run.RepoID) {
+			visibleRuns = append(visibleRuns, run)
 		}
 	}
-	log.Debug().
-		Int("total_runs_in_memory", totalRuns).
-		Time("min_run_date", minDate).
-		Time("max_run_date", maxDate).
-		Time("current_period_start", currentPeriodStart).
-		Time("previous_period_start", previousPeriodStart).
-		Msg("Dashboard summary date ranges")
 
-	for _, run := range m.runs {
+	for _, run := range visibleRuns {
 		// Current period (last 30 days)
 		if !run.StartedAt.Before(currentPeriodStart) {
 			summary.Runs.Total++
@@ -1006,11 +1077,6 @@ func (m *MemoryStorage) GetDashboardSummary(ctx context.Context) (*models.Dashbo
 		}
 	}
 
-	log.Debug().
-		Int("current_period_runs", summary.Runs.Total).
-		Int("previous_period_runs", summary.PreviousRuns.Total).
-		Msg("Dashboard summary results")
-
 	if summary.Runs.Total > 0 {
 		summary.Runs.SuccessRate = float64(summary.Runs.Success) / float64(summary.Runs.Total) * 100
 	}
@@ -1020,7 +1086,7 @@ func (m *MemoryStorage) GetDashboardSummary(ctx context.Context) (*models.Dashbo
 
 	// Recent runs (with repository info populated)
 	var recentRuns []models.WorkflowRun
-	for _, run := range m.runs {
+	for _, run := range visibleRuns {
 		runCopy := *run
 		// Populate repository info
 		if repo, ok := m.repositories[run.RepoID]; ok {
@@ -1043,7 +1109,7 @@ func (m *MemoryStorage) GetDashboardSummary(ctx context.Context) (*models.Dashbo
 	return summary, nil
 }
 
-func (m *MemoryStorage) GetTrends(ctx context.Context, days int) ([]models.Trend, error) {
+func (m *MemoryStorage) GetTrends(ctx context.Context, userID, days int) ([]models.Trend, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -1053,7 +1119,7 @@ func (m *MemoryStorage) GetTrends(ctx context.Context, days int) ([]models.Trend
 	dailyStats := make(map[string]*models.Trend)
 
 	for _, run := range m.runs {
-		if run.StartedAt.Before(startDate) {
+		if run.StartedAt.Before(startDate) || !m.canAccess(userID, run.RepoID) {
 			continue
 		}
 
@@ -1109,13 +1175,16 @@ func backfillIsDeploymentRun(workflowName, workflowPath, event string) bool {
 	return false
 }
 
-// BackfillDeploymentRuns sets IsDeployment on runs that match deployment heuristics.
-func (m *MemoryStorage) BackfillDeploymentRuns(ctx context.Context) (int, error) {
+// BackfillDeploymentRuns sets IsDeployment on the user's runs that match deployment heuristics.
+func (m *MemoryStorage) BackfillDeploymentRuns(ctx context.Context, userID int) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	updated := 0
 	for _, run := range m.runs {
+		if !m.canAccess(userID, run.RepoID) {
+			continue
+		}
 		wf, ok := m.workflows[run.WorkflowID]
 		if !ok {
 			continue
@@ -1163,12 +1232,15 @@ func (m *MemoryStorage) GetLatestRepositoryScore(ctx context.Context, repoID int
 	return latest, nil
 }
 
-func (m *MemoryStorage) ListLatestRepositoryScores(ctx context.Context) ([]models.RepositoryScore, error) {
+func (m *MemoryStorage) ListLatestRepositoryScores(ctx context.Context, userID int) ([]models.RepositoryScore, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	byRepo := make(map[int]*models.RepositoryScore)
 	for _, s := range m.repositoryScores {
+		if !m.canAccess(userID, s.RepoID) {
+			continue
+		}
 		existing, ok := byRepo[s.RepoID]
 		if !ok || s.ScannedAt.After(existing.ScannedAt) {
 			byRepo[s.RepoID] = s
@@ -1181,4 +1253,3 @@ func (m *MemoryStorage) ListLatestRepositoryScores(ctx context.Context) ([]model
 	sort.Slice(out, func(i, j int) bool { return out[i].RepoID < out[j].RepoID })
 	return out, nil
 }
-

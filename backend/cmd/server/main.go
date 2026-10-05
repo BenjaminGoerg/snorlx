@@ -12,8 +12,10 @@ import (
 	"snorlx/backend/internal/config"
 	"snorlx/backend/internal/github"
 	"snorlx/backend/internal/handlers"
+	"snorlx/backend/internal/httpmiddleware"
 	"snorlx/backend/internal/scorer"
 	"snorlx/backend/internal/storage"
+	"snorlx/backend/internal/tokencrypt"
 	"snorlx/backend/internal/version"
 	"snorlx/backend/internal/websocket"
 
@@ -25,6 +27,9 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
+
+// sessionCleanupInterval bounds the growth of the sessions table.
+const sessionCleanupInterval = time.Hour
 
 func main() {
 	// Load .env file if it exists (try current dir, then parent for monorepo setup)
@@ -52,13 +57,18 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to load configuration")
 	}
 
-	// Initialize storage based on STORAGE_MODE
-	storageMode := storage.StorageMode(cfg.StorageMode)
-	store, err := storage.NewStorage(storageMode, cfg.DatabaseURL)
+	// Token cipher: protects stored GitHub tokens; the key is derived from SESSION_SECRET
+	cipher, err := tokencrypt.New(cfg.SessionSecret)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to initialize token encryption")
+	}
+
+	// Initialize storage based on STORAGE_MODE (fails closed when the database is unreachable)
+	store, err := storage.NewStorage(storage.StorageMode(cfg.StorageMode), cfg.DatabaseURL, cipher)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialize storage")
 	}
-	defer storage.CloseStorage()
+	defer func() { _ = store.Close() }()
 
 	// Run migrations (no-op for memory storage)
 	if err := store.Migrate(); err != nil {
@@ -79,13 +89,19 @@ func main() {
 	sc := scorer.New(ghClient)
 	h := handlers.New(cfg, store, ghClient, wsHub, sc)
 
+	// Background maintenance stops with the process
+	maintenanceCtx, stopMaintenance := context.WithCancel(context.Background())
+	defer stopMaintenance()
+	go runSessionCleanup(maintenanceCtx, store)
+
 	// Setup router
 	r := chi.NewRouter()
 
 	// Middleware
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Logger)
+	// Client IP from proxy headers only when the peer is a configured trusted proxy
+	r.Use(httpmiddleware.TrustedRealIP(cfg.TrustedProxyCIDRs))
+	r.Use(httpmiddleware.RequestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
 
@@ -98,15 +114,16 @@ func main() {
 	// CORS
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{cfg.FrontendURL},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
 
-	// Health check (status code for probes, JSON body for clients)
+	// Health: liveness is process-only, readiness also checks the storage backend
 	r.Get("/health", h.Health)
+	r.Get("/health/ready", h.Ready)
 
 	// WebSocket endpoint (separate from /api for proper proxy handling)
 	r.Get("/ws", h.WebSocketHandler)
@@ -188,7 +205,7 @@ func main() {
 		Handler:           r,
 		ReadTimeout:       15 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      15 * time.Second,
+		WriteTimeout:      65 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -206,6 +223,7 @@ func main() {
 	<-quit
 
 	log.Info().Msg("Shutting down server...")
+	stopMaintenance()
 
 	// Give outstanding requests 30 seconds to complete
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -218,13 +236,32 @@ func main() {
 	log.Info().Msg("Server exited properly")
 }
 
+// runSessionCleanup deletes expired sessions periodically until ctx is cancelled.
+func runSessionCleanup(ctx context.Context, store storage.Storage) {
+	ticker := time.NewTicker(sessionCleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			if err := store.CleanExpiredSessions(cleanupCtx); err != nil {
+				log.Warn().Err(err).Msg("Failed to clean expired sessions")
+			}
+			cancel()
+		}
+	}
+}
+
 // securityHeadersMiddleware sets defensive HTTP headers on every response.
 func securityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		w.Header().Set("Cache-Control", "no-store")
 		next.ServeHTTP(w, r)
 	})
 }

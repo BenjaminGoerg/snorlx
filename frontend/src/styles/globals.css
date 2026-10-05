@@ -27,7 +27,7 @@
   --color-secondary-900: #112045;
   --color-secondary-950: #0a1023;
 
-  --font-sans: Inter, system-ui, -apple-system, sans-serif;
+  --font-sans: "Inter Variable", Inter, system-ui, -apple-system, sans-serif;
 
   --animate-shimmer: shimmer 2s infinite;
   --animate-float-1: float1 20s ease-in-out infinite;

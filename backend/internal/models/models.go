@@ -33,8 +33,8 @@ type Repository struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 
 	// Computed fields
-	Organization *Organization `json:"organization,omitempty"`
-	WorkflowCount int          `json:"workflow_count,omitempty"`
+	Organization  *Organization `json:"organization,omitempty"`
+	WorkflowCount int           `json:"workflow_count,omitempty"`
 }
 
 // Workflow represents a GitHub Actions workflow
@@ -52,11 +52,11 @@ type Workflow struct {
 	UpdatedAt            time.Time `json:"updated_at"`
 
 	// Computed fields
-	Repository     *Repository `json:"repository,omitempty"`
-	LastRun        *WorkflowRun `json:"last_run,omitempty"`
-	TotalRuns      int         `json:"total_runs,omitempty"`
-	SuccessRate    float64     `json:"success_rate,omitempty"`
-	AvgDuration    int         `json:"avg_duration_seconds,omitempty"`
+	Repository  *Repository  `json:"repository,omitempty"`
+	LastRun     *WorkflowRun `json:"last_run,omitempty"`
+	TotalRuns   int          `json:"total_runs,omitempty"`
+	SuccessRate float64      `json:"success_rate,omitempty"`
+	AvgDuration int          `json:"avg_duration_seconds,omitempty"`
 }
 
 // WorkflowRun represents a single execution of a workflow
@@ -176,13 +176,13 @@ type ApiToken struct {
 
 // DashboardSummary represents the dashboard overview
 type DashboardSummary struct {
-	Repositories     RepositorySummary `json:"repositories"`
-	Workflows        WorkflowSummary   `json:"workflows"`
-	Runs             RunSummary        `json:"runs"`
-	PreviousRuns     RunSummary        `json:"previous_runs"`
-	RecentRuns       []WorkflowRun     `json:"recent_runs"`
-	FailedRuns       []WorkflowRun     `json:"failed_runs"`
-	TopRepositories  []RepositoryStats `json:"top_repositories"`
+	Repositories    RepositorySummary `json:"repositories"`
+	Workflows       WorkflowSummary   `json:"workflows"`
+	Runs            RunSummary        `json:"runs"`
+	PreviousRuns    RunSummary        `json:"previous_runs"`
+	RecentRuns      []WorkflowRun     `json:"recent_runs"`
+	FailedRuns      []WorkflowRun     `json:"failed_runs"`
+	TopRepositories []RepositoryStats `json:"top_repositories"`
 }
 
 // RepositorySummary represents repository statistics
@@ -231,18 +231,18 @@ type Trend struct {
 
 // RepositoryScore represents a repository's grading result
 type RepositoryScore struct {
-	ID                  int       `json:"id"`
-	RepoID              int       `json:"repo_id"`
-	OverallScore        float64   `json:"overall_score"`
-	Tier                string    `json:"tier"` // "gold", "silver", "bronze", "none"
-	SecurityScore       float64   `json:"security_score"`
-	TestingScore        float64   `json:"testing_score"`
-	CICDScore           float64   `json:"cicd_score"`
-	DocumentationScore  float64   `json:"documentation_score"`
-	CodeQualityScore    float64   `json:"code_quality_score"`
-	MaintenanceScore    float64   `json:"maintenance_score"`
-	CommunityScore      float64   `json:"community_score"`
-	CheckResults       JSONMap    `json:"check_results"` // detailed pass/fail per check
+	ID                 int       `json:"id"`
+	RepoID             int       `json:"repo_id"`
+	OverallScore       float64   `json:"overall_score"`
+	Tier               string    `json:"tier"` // "gold", "silver", "bronze", "none"
+	SecurityScore      float64   `json:"security_score"`
+	TestingScore       float64   `json:"testing_score"`
+	CICDScore          float64   `json:"cicd_score"`
+	DocumentationScore float64   `json:"documentation_score"`
+	CodeQualityScore   float64   `json:"code_quality_score"`
+	MaintenanceScore   float64   `json:"maintenance_score"`
+	CommunityScore     float64   `json:"community_score"`
+	CheckResults       JSONMap   `json:"check_results"` // detailed pass/fail per check
 	ScannedAt          time.Time `json:"scanned_at"`
 	CreatedAt          time.Time `json:"created_at"`
 }

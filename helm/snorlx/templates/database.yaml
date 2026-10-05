@@ -17,9 +17,19 @@ spec:
       labels:
         {{- include "snorlx.database.selectorLabels" . | nindent 8 }}
     spec:
+      serviceAccountName: {{ include "snorlx.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.database.securityContext | nindent 8 }}
       containers:
         - name: timescaledb
-          image: "{{ .Values.database.image.repository }}:{{ .Values.database.image.tag }}"
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          image: {{ include "snorlx.databaseImage" . | quote }}
           imagePullPolicy: {{ .Values.database.image.pullPolicy }}
           ports:
             - containerPort: 5432
@@ -30,7 +40,7 @@ spec:
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "snorlx.fullname" . }}-secrets
+                  name: {{ include "snorlx.secretName" . }}
                   key: postgres-password
             - name: POSTGRES_DB
               value: snorlx
@@ -69,4 +79,3 @@ spec:
           requests:
             storage: {{ .Values.database.storage.size }}
 {{- end }}
-

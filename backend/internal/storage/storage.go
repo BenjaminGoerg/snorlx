@@ -1,52 +1,37 @@
 package storage
 
 import (
+	"errors"
+	"fmt"
+
+	"snorlx/backend/internal/tokencrypt"
+
 	"github.com/rs/zerolog/log"
 )
 
-var storageInstance Storage
-
-// NewStorage creates a new storage instance based on the mode and configuration
-func NewStorage(mode StorageMode, databaseURL string) (Storage, error) {
-	if storageInstance != nil {
-		return storageInstance, nil
-	}
-
-	var err error
-
-	// Determine effective storage mode
-	// If database mode is requested but no DATABASE_URL, fall back to memory
-	effectiveMode := mode
-	if mode == StorageModeDatabase && databaseURL == "" {
-		log.Warn().Msg("STORAGE_MODE=database but DATABASE_URL is not set, falling back to memory mode")
-		effectiveMode = StorageModeMemory
-	}
-
-	switch effectiveMode {
+// NewStorage creates the storage backend for the requested mode.
+//
+// Database mode fails closed: a missing DATABASE_URL or an unreachable database is an error, never a
+// silent fallback to memory, because that would present an empty but "healthy" dashboard and lose
+// every write made while the database is down.
+func NewStorage(mode StorageMode, databaseURL string, cipher *tokencrypt.Cipher) (Storage, error) {
+	switch mode {
 	case StorageModeDatabase:
-		log.Info().Msg("Initializing database storage (PostgreSQL + TimescaleDB)")
-		storageInstance, err = NewDatabaseStorage(databaseURL)
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to initialize database storage, falling back to memory mode")
-			storageInstance = NewMemoryStorage()
+		if databaseURL == "" {
+			return nil, errors.New("STORAGE_MODE=database requires DATABASE_URL")
 		}
+		if cipher == nil {
+			return nil, errors.New("database storage requires a token cipher")
+		}
+		log.Info().Msg("Initializing database storage (PostgreSQL + TimescaleDB)")
+		store, err := NewDatabaseStorage(databaseURL, cipher)
+		if err != nil {
+			return nil, fmt.Errorf("initialize database storage: %w", err)
+		}
+		return store, nil
+	case StorageModeMemory:
+		return NewMemoryStorage(), nil
 	default:
-		storageInstance = NewMemoryStorage()
+		return nil, fmt.Errorf("unknown storage mode %q", mode)
 	}
-
-	return storageInstance, nil
 }
-
-// GetStorage returns the current storage instance
-func GetStorage() Storage {
-	return storageInstance
-}
-
-// CloseStorage closes the storage connection
-func CloseStorage() error {
-	if storageInstance != nil {
-		return storageInstance.Close()
-	}
-	return nil
-}
-

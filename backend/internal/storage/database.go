@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"snorlx/backend/internal/models"
+	"snorlx/backend/internal/tokencrypt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,11 +19,15 @@ import (
 
 // DatabaseStorage implements Storage interface using PostgreSQL + TimescaleDB
 type DatabaseStorage struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	cipher *tokencrypt.Cipher
 }
 
-// NewDatabaseStorage creates a new database storage instance
-func NewDatabaseStorage(databaseURL string) (*DatabaseStorage, error) {
+// NewDatabaseStorage creates a new database storage instance. cipher protects GitHub tokens at rest.
+func NewDatabaseStorage(databaseURL string, cipher *tokencrypt.Cipher) (*DatabaseStorage, error) {
+	if cipher == nil {
+		return nil, errors.New("database storage requires a token cipher")
+	}
 	config, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, err
@@ -49,13 +54,78 @@ func NewDatabaseStorage(databaseURL string) (*DatabaseStorage, error) {
 
 	log.Info().Msg("Database connection established (PostgreSQL)")
 
-	return &DatabaseStorage{pool: pool}, nil
+	return &DatabaseStorage{pool: pool, cipher: cipher}, nil
 }
 
 // Close closes the database connection pool
 func (d *DatabaseStorage) Close() error {
 	d.pool.Close()
 	return nil
+}
+
+// Ping reports whether the database answers (readiness probe).
+func (d *DatabaseStorage) Ping(ctx context.Context) error {
+	return d.pool.Ping(ctx)
+}
+
+// decryptUserTokens replaces the stored (encrypted) token columns on user with their plaintext.
+func (d *DatabaseStorage) decryptUserTokens(user *models.User) error {
+	accessToken, err := d.cipher.Decrypt(user.AccessToken)
+	if err != nil {
+		return fmt.Errorf("decrypt access token for user %d: %w", user.ID, err)
+	}
+	user.AccessToken = accessToken
+	if user.RefreshToken != nil {
+		refresh, err := d.cipher.Decrypt(*user.RefreshToken)
+		if err != nil {
+			return fmt.Errorf("decrypt refresh token for user %d: %w", user.ID, err)
+		}
+		user.RefreshToken = &refresh
+	}
+	return nil
+}
+
+// escapeLike neutralises LIKE wildcards in user input so a search for "%" matches a literal percent.
+func escapeLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
+}
+
+// ===== Repository access (tenancy) =====
+
+func (d *DatabaseStorage) GrantRepositoryAccess(ctx context.Context, userID, repoID int) error {
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO user_repositories (user_id, repo_id)
+		VALUES ($1, $2)
+		ON CONFLICT (user_id, repo_id) DO NOTHING
+	`, userID, repoID)
+	return err
+}
+
+func (d *DatabaseStorage) HasRepositoryAccess(ctx context.Context, userID, repoID int) (bool, error) {
+	var exists bool
+	err := d.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM user_repositories WHERE user_id = $1 AND repo_id = $2)
+	`, userID, repoID).Scan(&exists)
+	return exists, err
+}
+
+func (d *DatabaseStorage) ListUsersWithRepositoryAccess(ctx context.Context, repoID int) ([]int, error) {
+	rows, err := d.pool.Query(ctx, `SELECT user_id FROM user_repositories WHERE repo_id = $1 ORDER BY user_id`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		users = append(users, id)
+	}
+	return users, rows.Err()
 }
 
 // Migrate runs database migrations
@@ -73,12 +143,17 @@ func (d *DatabaseStorage) Migrate() error {
 
 // ===== Organizations =====
 
-func (d *DatabaseStorage) ListOrganizations(ctx context.Context) ([]models.Organization, error) {
+func (d *DatabaseStorage) ListOrganizations(ctx context.Context, userID int) ([]models.Organization, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT id, github_id, login, name, avatar_url, settings, created_at, updated_at
-		FROM organizations
-		ORDER BY login
-	`)
+		SELECT o.id, o.github_id, o.login, o.name, o.avatar_url, o.settings, o.created_at, o.updated_at
+		FROM organizations o
+		WHERE EXISTS (
+			SELECT 1 FROM repositories r
+			JOIN user_repositories ur ON ur.repo_id = r.id
+			WHERE r.org_id = o.id AND ur.user_id = $1
+		)
+		ORDER BY o.login
+	`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -97,12 +172,17 @@ func (d *DatabaseStorage) ListOrganizations(ctx context.Context) ([]models.Organ
 	return orgs, nil
 }
 
-func (d *DatabaseStorage) GetOrganization(ctx context.Context, id int) (*models.Organization, error) {
+func (d *DatabaseStorage) GetOrganization(ctx context.Context, userID, id int) (*models.Organization, error) {
 	var org models.Organization
 	err := d.pool.QueryRow(ctx, `
-		SELECT id, github_id, login, name, avatar_url, settings, created_at, updated_at
-		FROM organizations WHERE id = $1
-	`, id).Scan(&org.ID, &org.GitHubID, &org.Login, &org.Name, &org.AvatarURL, &org.Settings, &org.CreatedAt, &org.UpdatedAt)
+		SELECT o.id, o.github_id, o.login, o.name, o.avatar_url, o.settings, o.created_at, o.updated_at
+		FROM organizations o
+		WHERE o.id = $1 AND EXISTS (
+			SELECT 1 FROM repositories r
+			JOIN user_repositories ur ON ur.repo_id = r.id
+			WHERE r.org_id = o.id AND ur.user_id = $2
+		)
+	`, id, userID).Scan(&org.ID, &org.GitHubID, &org.Login, &org.Name, &org.AvatarURL, &org.Settings, &org.CreatedAt, &org.UpdatedAt)
 	if err != nil {
 		return nil, errors.New("organization not found")
 	}
@@ -140,17 +220,25 @@ func (d *DatabaseStorage) UpsertOrganization(ctx context.Context, org *models.Or
 
 // ===== Repositories =====
 
-func (d *DatabaseStorage) ListRepositories(ctx context.Context, page, pageSize int, search string) ([]models.Repository, int, error) {
+func (d *DatabaseStorage) ListRepositories(ctx context.Context, userID, page, pageSize int, search string) ([]models.Repository, int, error) {
 	offset := (page - 1) * pageSize
-	searchPattern := "%" + strings.ToLower(strings.TrimSpace(search)) + "%"
+	searchPattern := "%" + escapeLike(strings.ToLower(strings.TrimSpace(search))) + "%"
 
 	// Get total count with search filter
 	var total int
 	var err error
 	if search != "" {
-		err = d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM repositories WHERE is_active = true AND (LOWER(name) LIKE $1 OR LOWER(full_name) LIKE $1)", searchPattern).Scan(&total)
+		err = d.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM repositories r
+			JOIN user_repositories ur ON ur.repo_id = r.id AND ur.user_id = $1
+			WHERE r.is_active = true AND (LOWER(r.name) LIKE $2 ESCAPE '\' OR LOWER(r.full_name) LIKE $2 ESCAPE '\')
+		`, userID, searchPattern).Scan(&total)
 	} else {
-		err = d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM repositories WHERE is_active = true").Scan(&total)
+		err = d.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM repositories r
+			JOIN user_repositories ur ON ur.repo_id = r.id AND ur.user_id = $1
+			WHERE r.is_active = true
+		`, userID).Scan(&total)
 	}
 	if err != nil {
 		return nil, 0, err
@@ -165,12 +253,13 @@ func (d *DatabaseStorage) ListRepositories(ctx context.Context, page, pageSize i
 			       r.created_at, r.updated_at,
 			       COUNT(DISTINCT w.id) as workflow_count
 			FROM repositories r
+			JOIN user_repositories ur ON ur.repo_id = r.id AND ur.user_id = $1
 			LEFT JOIN workflows w ON w.repo_id = r.id
-			WHERE r.is_active = true AND (LOWER(r.name) LIKE $1 OR LOWER(r.full_name) LIKE $1)
+			WHERE r.is_active = true AND (LOWER(r.name) LIKE $2 ESCAPE '\' OR LOWER(r.full_name) LIKE $2 ESCAPE '\')
 			GROUP BY r.id
 			ORDER BY r.full_name
-			LIMIT $2 OFFSET $3
-		`, searchPattern, pageSize, offset)
+			LIMIT $3 OFFSET $4
+		`, userID, searchPattern, pageSize, offset)
 	} else {
 		rows, err = d.pool.Query(ctx, `
 			SELECT r.id, r.github_id, r.org_id, r.name, r.full_name, r.description, 
@@ -178,12 +267,13 @@ func (d *DatabaseStorage) ListRepositories(ctx context.Context, page, pageSize i
 			       r.created_at, r.updated_at,
 			       COUNT(DISTINCT w.id) as workflow_count
 			FROM repositories r
+			JOIN user_repositories ur ON ur.repo_id = r.id AND ur.user_id = $1
 			LEFT JOIN workflows w ON w.repo_id = r.id
 			WHERE r.is_active = true
 			GROUP BY r.id
 			ORDER BY r.full_name
-			LIMIT $1 OFFSET $2
-		`, pageSize, offset)
+			LIMIT $2 OFFSET $3
+		`, userID, pageSize, offset)
 	}
 	if err != nil {
 		return nil, 0, err
@@ -284,7 +374,7 @@ func (d *DatabaseStorage) UpdateRepository(ctx context.Context, id int, repo *mo
 
 // ===== Workflows =====
 
-func (d *DatabaseStorage) ListWorkflows(ctx context.Context, repoID *int) ([]models.Workflow, error) {
+func (d *DatabaseStorage) ListWorkflows(ctx context.Context, userID int, repoID *int) ([]models.Workflow, error) {
 	query := `
 		SELECT w.id, w.github_id, w.repo_id, w.name, w.path, w.state, w.badge_url, w.html_url,
 		       w.is_deployment_workflow, w.created_at, w.updated_at,
@@ -314,12 +404,13 @@ func (d *DatabaseStorage) ListWorkflows(ctx context.Context, repoID *int) ([]mod
 			FROM workflow_runs wr
 			WHERE wr.workflow_id = w.id
 		) stats ON true
+		JOIN user_repositories ur ON ur.repo_id = w.repo_id AND ur.user_id = $1
 		WHERE 1=1
 	`
-	args := []interface{}{}
+	args := []interface{}{userID}
 
 	if repoID != nil {
-		query += " AND w.repo_id = $1"
+		query += " AND w.repo_id = $2"
 		args = append(args, *repoID)
 	}
 	query += " ORDER BY w.name"
@@ -552,7 +643,7 @@ func (d *DatabaseStorage) UpdateWorkflow(ctx context.Context, id int, workflow *
 
 // ===== Workflow Runs =====
 
-func (d *DatabaseStorage) ListRuns(ctx context.Context, filters *models.RunFilters, page, pageSize int) ([]models.WorkflowRun, int, error) {
+func (d *DatabaseStorage) ListRuns(ctx context.Context, userID int, filters *models.RunFilters, page, pageSize int) ([]models.WorkflowRun, int, error) {
 	offset := (page - 1) * pageSize
 
 	query := `
@@ -564,11 +655,16 @@ func (d *DatabaseStorage) ListRuns(ctx context.Context, filters *models.RunFilte
 		FROM workflow_runs wr
 		JOIN workflows w ON w.id = wr.workflow_id
 		JOIN repositories r ON r.id = wr.repo_id
+		JOIN user_repositories ur ON ur.repo_id = wr.repo_id AND ur.user_id = $1
 		WHERE 1=1
 	`
-	countQuery := "SELECT COUNT(*) FROM workflow_runs wr WHERE 1=1"
-	args := []interface{}{}
-	argCount := 0
+	countQuery := `
+		SELECT COUNT(*) FROM workflow_runs wr
+		JOIN user_repositories ur ON ur.repo_id = wr.repo_id AND ur.user_id = $1
+		WHERE 1=1
+	`
+	args := []interface{}{userID}
+	argCount := 1
 
 	// Apply filters
 	if filters != nil {
@@ -642,7 +738,7 @@ func (d *DatabaseStorage) ListRuns(ctx context.Context, filters *models.RunFilte
 	return runs, total, nil
 }
 
-func (d *DatabaseStorage) ListActivePipelines(ctx context.Context) ([]models.WorkflowRun, error) {
+func (d *DatabaseStorage) ListActivePipelines(ctx context.Context, userID int) ([]models.WorkflowRun, error) {
 	query := `
 		SELECT wr.id, wr.github_id, wr.workflow_id, wr.repo_id, wr.run_number, wr.name,
 		       wr.status, wr.conclusion, wr.event, wr.branch, wr.commit_sha, wr.commit_message,
@@ -652,10 +748,11 @@ func (d *DatabaseStorage) ListActivePipelines(ctx context.Context) ([]models.Wor
 		FROM workflow_runs wr
 		JOIN workflows w ON w.id = wr.workflow_id
 		JOIN repositories r ON r.id = wr.repo_id
+		JOIN user_repositories ur ON ur.repo_id = wr.repo_id AND ur.user_id = $1
 		WHERE wr.status IN ('in_progress', 'queued')
 		ORDER BY wr.started_at DESC
 	`
-	rows, err := d.pool.Query(ctx, query)
+	rows, err := d.pool.Query(ctx, query, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -892,6 +989,9 @@ func (d *DatabaseStorage) GetUserByID(ctx context.Context, id int) (*models.User
 	if err != nil {
 		return nil, errors.New("user not found")
 	}
+	if err := d.decryptUserTokens(&user); err != nil {
+		return nil, err
+	}
 	return &user, nil
 }
 
@@ -907,23 +1007,40 @@ func (d *DatabaseStorage) GetUserByGitHubID(ctx context.Context, githubID int64)
 	if err != nil {
 		return nil, errors.New("user not found")
 	}
+	if err := d.decryptUserTokens(&user); err != nil {
+		return nil, err
+	}
 	return &user, nil
 }
 
+// UpsertUser stores the user; GitHub tokens are encrypted before they reach the database.
 func (d *DatabaseStorage) UpsertUser(ctx context.Context, user *models.User) (*models.User, error) {
-	err := d.pool.QueryRow(ctx, `
-		INSERT INTO users (github_id, login, name, email, avatar_url, access_token, token_expires_at, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+	encryptedAccess, err := d.cipher.Encrypt(user.AccessToken)
+	if err != nil {
+		return nil, err
+	}
+	var encryptedRefresh *string
+	if user.RefreshToken != nil {
+		enc, err := d.cipher.Encrypt(*user.RefreshToken)
+		if err != nil {
+			return nil, err
+		}
+		encryptedRefresh = &enc
+	}
+	err = d.pool.QueryRow(ctx, `
+		INSERT INTO users (github_id, login, name, email, avatar_url, access_token, refresh_token, token_expires_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
 		ON CONFLICT (github_id) DO UPDATE SET
 			login = EXCLUDED.login,
 			name = EXCLUDED.name,
 			email = EXCLUDED.email,
 			avatar_url = EXCLUDED.avatar_url,
 			access_token = EXCLUDED.access_token,
+			refresh_token = EXCLUDED.refresh_token,
 			token_expires_at = EXCLUDED.token_expires_at,
 			updated_at = NOW()
 		RETURNING id, github_id, login, name, email, avatar_url
-	`, user.GitHubID, user.Login, user.Name, user.Email, user.AvatarURL, user.AccessToken, user.TokenExpiresAt).Scan(
+	`, user.GitHubID, user.Login, user.Name, user.Email, user.AvatarURL, encryptedAccess, encryptedRefresh, user.TokenExpiresAt).Scan(
 		&user.ID, &user.GitHubID, &user.Login, &user.Name, &user.Email, &user.AvatarURL,
 	)
 	return user, err
@@ -953,6 +1070,9 @@ func (d *DatabaseStorage) GetSession(ctx context.Context, sessionID string) (*mo
 	)
 	if err != nil {
 		return nil, nil, errors.New("session not found or expired")
+	}
+	if err := d.decryptUserTokens(&user); err != nil {
+		return nil, nil, err
 	}
 
 	return &session, &user, nil
@@ -1028,6 +1148,9 @@ func (d *DatabaseStorage) GetApiTokenByHash(ctx context.Context, tokenHash strin
 	if err != nil {
 		return nil, nil, errors.New("token not found")
 	}
+	if err := d.decryptUserTokens(&user); err != nil {
+		return nil, nil, err
+	}
 	_ = json.Unmarshal(scopesJSON, &t.Scopes)
 	return &t, &user, nil
 }
@@ -1053,17 +1176,18 @@ func (d *DatabaseStorage) TouchApiTokenLastUsed(ctx context.Context, tokenID int
 
 // ===== Dashboard & Metrics =====
 
-func (d *DatabaseStorage) GetDashboardSummary(ctx context.Context) (*models.DashboardSummary, error) {
+func (d *DatabaseStorage) GetDashboardSummary(ctx context.Context, userID int) (*models.DashboardSummary, error) {
 	summary := &models.DashboardSummary{}
 
 	// Get repository stats
 	if err := d.pool.QueryRow(ctx, `
 		SELECT 
 			COUNT(*),
-			COUNT(*) FILTER (WHERE is_active = true),
-			COUNT(*) FILTER (WHERE is_active = false)
-		FROM repositories
-	`).Scan(&summary.Repositories.Total, &summary.Repositories.Active, &summary.Repositories.Inactive); err != nil {
+			COUNT(*) FILTER (WHERE r.is_active = true),
+			COUNT(*) FILTER (WHERE r.is_active = false)
+		FROM repositories r
+		JOIN user_repositories ur ON ur.repo_id = r.id AND ur.user_id = $1
+	`, userID).Scan(&summary.Repositories.Total, &summary.Repositories.Active, &summary.Repositories.Inactive); err != nil {
 		return nil, err
 	}
 
@@ -1071,10 +1195,11 @@ func (d *DatabaseStorage) GetDashboardSummary(ctx context.Context) (*models.Dash
 	if err := d.pool.QueryRow(ctx, `
 		SELECT 
 			COUNT(*),
-			COUNT(*) FILTER (WHERE state = 'active'),
-			COUNT(*) FILTER (WHERE state = 'disabled')
-		FROM workflows
-	`).Scan(&summary.Workflows.Total, &summary.Workflows.Active, &summary.Workflows.Disabled); err != nil {
+			COUNT(*) FILTER (WHERE w.state = 'active'),
+			COUNT(*) FILTER (WHERE w.state = 'disabled')
+		FROM workflows w
+		JOIN user_repositories ur ON ur.repo_id = w.repo_id AND ur.user_id = $1
+	`, userID).Scan(&summary.Workflows.Total, &summary.Workflows.Active, &summary.Workflows.Disabled); err != nil {
 		return nil, err
 	}
 
@@ -1083,15 +1208,16 @@ func (d *DatabaseStorage) GetDashboardSummary(ctx context.Context) (*models.Dash
 	err := d.pool.QueryRow(ctx, `
 		SELECT 
 			COUNT(*),
-			COUNT(*) FILTER (WHERE conclusion = 'success'),
-			COUNT(*) FILTER (WHERE conclusion = 'failure'),
-			COUNT(*) FILTER (WHERE status = 'in_progress'),
-			COUNT(*) FILTER (WHERE status = 'queued'),
-			COUNT(*) FILTER (WHERE conclusion = 'cancelled'),
-			COALESCE(SUM(duration_seconds), 0)
-		FROM workflow_runs
-		WHERE started_at >= NOW() - INTERVAL '1 month'
-	`).Scan(
+			COUNT(*) FILTER (WHERE wr.conclusion = 'success'),
+			COUNT(*) FILTER (WHERE wr.conclusion = 'failure'),
+			COUNT(*) FILTER (WHERE wr.status = 'in_progress'),
+			COUNT(*) FILTER (WHERE wr.status = 'queued'),
+			COUNT(*) FILTER (WHERE wr.conclusion = 'cancelled'),
+			COALESCE(SUM(wr.duration_seconds), 0)
+		FROM workflow_runs wr
+		JOIN user_repositories ur ON ur.repo_id = wr.repo_id AND ur.user_id = $1
+		WHERE wr.started_at >= NOW() - INTERVAL '1 month'
+	`, userID).Scan(
 		&currentTotal,
 		&currentSuccess,
 		&currentFailed,
@@ -1120,16 +1246,17 @@ func (d *DatabaseStorage) GetDashboardSummary(ctx context.Context) (*models.Dash
 	err = d.pool.QueryRow(ctx, `
 		SELECT 
 			COUNT(*),
-			COUNT(*) FILTER (WHERE conclusion = 'success'),
-			COUNT(*) FILTER (WHERE conclusion = 'failure'),
-			COUNT(*) FILTER (WHERE status = 'in_progress'),
-			COUNT(*) FILTER (WHERE status = 'queued'),
-			COUNT(*) FILTER (WHERE conclusion = 'cancelled'),
-			COALESCE(SUM(duration_seconds), 0)
-		FROM workflow_runs
-		WHERE started_at >= NOW() - INTERVAL '2 months'
-		  AND started_at < NOW() - INTERVAL '1 month'
-	`).Scan(
+			COUNT(*) FILTER (WHERE wr.conclusion = 'success'),
+			COUNT(*) FILTER (WHERE wr.conclusion = 'failure'),
+			COUNT(*) FILTER (WHERE wr.status = 'in_progress'),
+			COUNT(*) FILTER (WHERE wr.status = 'queued'),
+			COUNT(*) FILTER (WHERE wr.conclusion = 'cancelled'),
+			COALESCE(SUM(wr.duration_seconds), 0)
+		FROM workflow_runs wr
+		JOIN user_repositories ur ON ur.repo_id = wr.repo_id AND ur.user_id = $1
+		WHERE wr.started_at >= NOW() - INTERVAL '2 months'
+		  AND wr.started_at < NOW() - INTERVAL '1 month'
+	`, userID).Scan(
 		&prevTotal,
 		&prevSuccess,
 		&prevFailed,
@@ -1154,14 +1281,18 @@ func (d *DatabaseStorage) GetDashboardSummary(ctx context.Context) (*models.Dash
 	}
 
 	// Get recent runs
-	rows, _ := d.pool.Query(ctx, `
-		SELECT id, github_id, workflow_id, repo_id, run_number, name,
-		       status, conclusion, event, branch, commit_sha, actor_login,
-		       html_url, started_at, completed_at, duration_seconds
-		FROM workflow_runs
-		ORDER BY started_at DESC
+	rows, err := d.pool.Query(ctx, `
+		SELECT wr.id, wr.github_id, wr.workflow_id, wr.repo_id, wr.run_number, wr.name,
+		       wr.status, wr.conclusion, wr.event, wr.branch, wr.commit_sha, wr.actor_login,
+		       wr.html_url, wr.started_at, wr.completed_at, wr.duration_seconds
+		FROM workflow_runs wr
+		JOIN user_repositories ur ON ur.repo_id = wr.repo_id AND ur.user_id = $1
+		ORDER BY wr.started_at DESC
 		LIMIT 10
-	`)
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 
 	for rows.Next() {
@@ -1176,23 +1307,24 @@ func (d *DatabaseStorage) GetDashboardSummary(ctx context.Context) (*models.Dash
 		summary.RecentRuns = append(summary.RecentRuns, run)
 	}
 
-	return summary, nil
+	return summary, rows.Err()
 }
 
-func (d *DatabaseStorage) GetTrends(ctx context.Context, days int) ([]models.Trend, error) {
+func (d *DatabaseStorage) GetTrends(ctx context.Context, userID, days int) ([]models.Trend, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT 
-			DATE_TRUNC('day', started_at) as date,
+			DATE_TRUNC('day', wr.started_at) as date,
 			COUNT(*) as total_runs,
-			COUNT(*) FILTER (WHERE conclusion = 'success') as successful_runs,
-			COUNT(*) FILTER (WHERE conclusion = 'failure') as failed_runs,
-			COALESCE(AVG(duration_seconds), 0) as avg_duration,
-			COUNT(*) FILTER (WHERE is_deployment = true) as deployment_count
-		FROM workflow_runs
-		WHERE started_at >= NOW() - INTERVAL '1 day' * $1
-		GROUP BY DATE_TRUNC('day', started_at)
+			COUNT(*) FILTER (WHERE wr.conclusion = 'success') as successful_runs,
+			COUNT(*) FILTER (WHERE wr.conclusion = 'failure') as failed_runs,
+			COALESCE(AVG(wr.duration_seconds), 0) as avg_duration,
+			COUNT(*) FILTER (WHERE wr.is_deployment = true) as deployment_count
+		FROM workflow_runs wr
+		JOIN user_repositories ur ON ur.repo_id = wr.repo_id AND ur.user_id = $1
+		WHERE wr.started_at >= NOW() - INTERVAL '1 day' * $2
+		GROUP BY DATE_TRUNC('day', wr.started_at)
 		ORDER BY date
-	`, days)
+	`, userID, days)
 	if err != nil {
 		return nil, err
 	}
@@ -1215,14 +1347,15 @@ func (d *DatabaseStorage) GetTrends(ctx context.Context, days int) ([]models.Tre
 	return trends, nil
 }
 
-// BackfillDeploymentRuns sets is_deployment = true on workflow_runs that match deployment heuristics
+// BackfillDeploymentRuns sets is_deployment = true on the user's workflow_runs that match deployment heuristics
 // (workflow name/path contains release|deploy|cd, or event is deployment|release, or workflow is marked deployment).
-func (d *DatabaseStorage) BackfillDeploymentRuns(ctx context.Context) (int, error) {
+func (d *DatabaseStorage) BackfillDeploymentRuns(ctx context.Context, userID int) (int, error) {
 	result, err := d.pool.Exec(ctx, `
 		UPDATE workflow_runs wr
 		SET is_deployment = true
-		FROM workflows w
+		FROM workflows w, user_repositories ur
 		WHERE wr.workflow_id = w.id
+		  AND ur.repo_id = wr.repo_id AND ur.user_id = $1
 		  AND (
 		    w.is_deployment_workflow = true
 		    OR w.name ILIKE '%release%' OR w.name ILIKE '%deploy%' OR w.name ILIKE '%cd%'
@@ -1230,7 +1363,7 @@ func (d *DatabaseStorage) BackfillDeploymentRuns(ctx context.Context) (int, erro
 		    OR wr.event IN ('deployment', 'release')
 		  )
 		  AND wr.is_deployment = false
-	`)
+	`, userID)
 	if err != nil {
 		return 0, err
 	}
@@ -1285,12 +1418,13 @@ func (d *DatabaseStorage) GetLatestRepositoryScore(ctx context.Context, repoID i
 	return &score, nil
 }
 
-func (d *DatabaseStorage) ListLatestRepositoryScores(ctx context.Context) ([]models.RepositoryScore, error) {
+func (d *DatabaseStorage) ListLatestRepositoryScores(ctx context.Context, userID int) ([]models.RepositoryScore, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT DISTINCT ON (repo_id) id, repo_id, overall_score, tier, security_score, testing_score, cicd_score, documentation_score, code_quality_score, maintenance_score, community_score, check_results, scanned_at, created_at
-		FROM repository_scores
-		ORDER BY repo_id, scanned_at DESC
-	`)
+		SELECT DISTINCT ON (s.repo_id) s.id, s.repo_id, s.overall_score, s.tier, s.security_score, s.testing_score, s.cicd_score, s.documentation_score, s.code_quality_score, s.maintenance_score, s.community_score, s.check_results, s.scanned_at, s.created_at
+		FROM repository_scores s
+		JOIN user_repositories ur ON ur.repo_id = s.repo_id AND ur.user_id = $1
+		ORDER BY s.repo_id, s.scanned_at DESC
+	`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -1502,6 +1636,15 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 
+-- Repository visibility per user: a user sees a repository only after syncing it with their own token.
+CREATE TABLE IF NOT EXISTS user_repositories (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    repo_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    granted_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (user_id, repo_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_repositories_repo_id ON user_repositories(repo_id);
+
 -- Personal API tokens (MCP / automation)
 CREATE TABLE IF NOT EXISTS api_tokens (
     id SERIAL PRIMARY KEY,
@@ -1570,4 +1713,3 @@ SELECT add_continuous_aggregate_policy('daily_workflow_metrics',
 SELECT add_retention_policy('workflow_runs', INTERVAL '1 year', if_not_exists => TRUE);
 SELECT add_retention_policy('workflow_jobs', INTERVAL '1 year', if_not_exists => TRUE);
 `
-

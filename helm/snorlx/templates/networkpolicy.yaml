@@ -1,0 +1,114 @@
+{{- if .Values.networkPolicy.enabled }}
+# Default deny for every Snorlx pod, then explicit allows per component.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "snorlx.fullname" . }}-default-deny
+  labels:
+    {{- include "snorlx.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "snorlx.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Frontend: accepts HTTP from anywhere (the ingress controller), talks only to the backend and DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "snorlx.fullname" . }}-frontend
+  labels:
+    {{- include "snorlx.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "snorlx.frontend.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.frontend.port }}
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "snorlx.backend.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.backend.port }}
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Backend: accepts HTTP from anywhere (ingress controller and frontend proxy), reaches the
+# database, DNS and HTTPS (GitHub API and OAuth).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "snorlx.fullname" . }}-backend
+  labels:
+    {{- include "snorlx.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "snorlx.backend.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.backend.port }}
+  egress:
+    {{- if .Values.database.internal }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "snorlx.database.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    {{- else }}
+    - ports:
+        - protocol: TCP
+          port: 5432
+    {{- end }}
+    - ports:
+        - protocol: TCP
+          port: 443
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- if .Values.database.internal }}
+---
+# Database: accepts connections only from the backend.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "snorlx.fullname" . }}-database
+  labels:
+    {{- include "snorlx.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "snorlx.database.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "snorlx.backend.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+{{- end }}
+{{- end }}

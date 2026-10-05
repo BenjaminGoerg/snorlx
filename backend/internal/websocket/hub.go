@@ -24,26 +24,17 @@ const (
 	maxMessageSize = 512
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
-
-// GetUpgraderWithOrigin returns a WebSocket upgrader that only accepts connections
-// from the specified allowed origin. Pass an empty string to allow all origins (insecure).
+// GetUpgraderWithOrigin returns a WebSocket upgrader that only accepts connections from the
+// configured frontend origin. An empty allowed origin rejects every upgrade (fail closed).
 func GetUpgraderWithOrigin(allowedOrigin string) websocket.Upgrader {
 	return websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 		CheckOrigin: func(r *http.Request) bool {
 			if allowedOrigin == "" {
-				return true
+				return false
 			}
-			origin := r.Header.Get("Origin")
-			return origin == allowedOrigin
+			return r.Header.Get("Origin") == allowedOrigin
 		},
 	}
 }
@@ -52,6 +43,12 @@ func GetUpgraderWithOrigin(allowedOrigin string) websocket.Upgrader {
 type Message struct {
 	Type string      `json:"type"`
 	Data interface{} `json:"data"`
+}
+
+// envelope is a serialized message addressed to a set of users.
+type envelope struct {
+	payload    []byte
+	recipients map[int]struct{}
 }
 
 // Client represents a connected WebSocket client
@@ -63,10 +60,11 @@ type Client struct {
 	send   chan []byte
 }
 
-// Hub manages WebSocket client connections
+// Hub manages WebSocket client connections. Every message is addressed to explicit user IDs so a
+// user only receives events for repositories they may see.
 type Hub struct {
 	clients    map[*Client]bool
-	broadcast  chan Message
+	outbox     chan envelope
 	register   chan *Client
 	unregister chan *Client
 	mu         sync.RWMutex
@@ -76,7 +74,7 @@ type Hub struct {
 func NewHub() *Hub {
 	return &Hub{
 		clients:    make(map[*Client]bool),
-		broadcast:  make(chan Message, 256),
+		outbox:     make(chan envelope, 256),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 	}
@@ -101,27 +99,42 @@ func (h *Hub) Run() {
 			h.mu.Unlock()
 			log.Debug().Str("client_id", client.ID).Msg("WebSocket client disconnected")
 
-		case message := <-h.broadcast:
-			h.mu.RLock()
-			data, err := json.Marshal(message)
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to marshal WebSocket message")
-				h.mu.RUnlock()
-				continue
-			}
-
-			for client := range h.clients {
-				select {
-				case client.send <- data:
-				default:
-					close(client.send)
-					delete(h.clients, client)
-					log.Warn().Str("client_id", client.ID).Msg("WebSocket client buffer full, disconnecting")
-				}
-			}
-			h.mu.RUnlock()
+		case env := <-h.outbox:
+			h.deliver(env)
 		}
 	}
+}
+
+// deliver fans an envelope out to the recipients. Clients whose buffer is full are disconnected
+// after the read lock is released, so the client map is never written under RLock.
+func (h *Hub) deliver(env envelope) {
+	var slow []*Client
+
+	h.mu.RLock()
+	for client := range h.clients {
+		if _, ok := env.recipients[client.UserID]; !ok {
+			continue
+		}
+		select {
+		case client.send <- env.payload:
+		default:
+			slow = append(slow, client)
+		}
+	}
+	h.mu.RUnlock()
+
+	if len(slow) == 0 {
+		return
+	}
+	h.mu.Lock()
+	for _, client := range slow {
+		if _, ok := h.clients[client]; ok {
+			delete(h.clients, client)
+			close(client.send)
+			log.Warn().Str("client_id", client.ID).Msg("WebSocket client buffer full, disconnecting")
+		}
+	}
+	h.mu.Unlock()
 }
 
 // Register registers a new client
@@ -134,52 +147,58 @@ func (h *Hub) Unregister(client *Client) {
 	h.unregister <- client
 }
 
-// Broadcast sends a message to all connected clients
-func (h *Hub) Broadcast(message Message) {
-	h.broadcast <- message
+// SendToUsers delivers message to every connected client of the given users.
+func (h *Hub) SendToUsers(userIDs []int, message Message) {
+	if len(userIDs) == 0 {
+		return
+	}
+	payload, err := json.Marshal(message)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to marshal WebSocket message")
+		return
+	}
+	recipients := make(map[int]struct{}, len(userIDs))
+	for _, id := range userIDs {
+		recipients[id] = struct{}{}
+	}
+	h.outbox <- envelope{payload: payload, recipients: recipients}
 }
 
-// BroadcastWorkflowRunUpdate sends a workflow run update event
-func (h *Hub) BroadcastWorkflowRunUpdate(run interface{}) {
-	h.Broadcast(Message{
-		Type: "workflow_run",
-		Data: run,
-	})
+// SendToUser delivers message to one user.
+func (h *Hub) SendToUser(userID int, message Message) {
+	h.SendToUsers([]int{userID}, message)
 }
 
-// BroadcastWorkflowJobUpdate sends a workflow job update event
-func (h *Hub) BroadcastWorkflowJobUpdate(job interface{}) {
-	h.Broadcast(Message{
-		Type: "workflow_job",
-		Data: job,
-	})
+// SendWorkflowRunUpdate sends a workflow run update event to the users who may see the repository.
+func (h *Hub) SendWorkflowRunUpdate(userIDs []int, run interface{}) {
+	h.SendToUsers(userIDs, Message{Type: "workflow_run", Data: run})
 }
 
-// BroadcastDeploymentUpdate sends a deployment update event
-func (h *Hub) BroadcastDeploymentUpdate(deployment interface{}) {
-	h.Broadcast(Message{
-		Type: "deployment",
-		Data: deployment,
-	})
+// SendWorkflowJobUpdate sends a workflow job update event to the users who may see the repository.
+func (h *Hub) SendWorkflowJobUpdate(userIDs []int, job interface{}) {
+	h.SendToUsers(userIDs, Message{Type: "workflow_job", Data: job})
 }
 
-// BroadcastSyncStart sends a sync start event
-func (h *Hub) BroadcastSyncStart(total int) {
-	h.Broadcast(Message{
+// SendDeploymentUpdate sends a deployment update event to the users who may see the repository.
+func (h *Hub) SendDeploymentUpdate(userIDs []int, deployment interface{}) {
+	h.SendToUsers(userIDs, Message{Type: "deployment", Data: deployment})
+}
+
+// SendSyncStart tells the user who started a sync how many repositories it covers.
+func (h *Hub) SendSyncStart(userID, total int) {
+	h.SendToUser(userID, Message{
 		Type: "sync:start",
-		Data: map[string]interface{}{
-			"total": total,
-		},
+		Data: map[string]interface{}{"total": total},
 	})
 }
 
-// BroadcastSyncProgress sends a sync progress event
-func (h *Hub) BroadcastSyncProgress(synced, total int, current string) {
+// SendSyncProgress reports sync progress to the user who started it.
+func (h *Hub) SendSyncProgress(userID, synced, total int, current string) {
 	progress := 0
 	if total > 0 {
 		progress = (synced * 100) / total
 	}
-	h.Broadcast(Message{
+	h.SendToUser(userID, Message{
 		Type: "sync:progress",
 		Data: map[string]interface{}{
 			"synced":   synced,
@@ -190,9 +209,9 @@ func (h *Hub) BroadcastSyncProgress(synced, total int, current string) {
 	})
 }
 
-// BroadcastSyncComplete sends a sync complete event
-func (h *Hub) BroadcastSyncComplete(repos, workflows, runs int) {
-	h.Broadcast(Message{
+// SendSyncComplete reports the sync outcome to the user who started it.
+func (h *Hub) SendSyncComplete(userID, repos, workflows, runs int) {
+	h.SendToUser(userID, Message{
 		Type: "sync:complete",
 		Data: map[string]interface{}{
 			"repositories": repos,
@@ -202,13 +221,11 @@ func (h *Hub) BroadcastSyncComplete(repos, workflows, runs int) {
 	})
 }
 
-// BroadcastSyncError sends a sync error event
-func (h *Hub) BroadcastSyncError(message string) {
-	h.Broadcast(Message{
+// SendSyncError reports a sync failure to the user who started it.
+func (h *Hub) SendSyncError(userID int, message string) {
+	h.SendToUser(userID, Message{
 		Type: "sync:error",
-		Data: map[string]interface{}{
-			"message": message,
-		},
+		Data: map[string]interface{}{"message": message},
 	})
 }
 
@@ -290,11 +307,3 @@ func (c *Client) WritePump() {
 		}
 	}
 }
-
-// GetUpgrader returns the WebSocket upgrader
-func GetUpgrader() *websocket.Upgrader {
-	return &upgrader
-}
-
-
-

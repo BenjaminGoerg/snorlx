@@ -1,6 +1,7 @@
 # Build stage: use a 1.27 image for availability; go.mod pins the patch for govulncheck.
 # BUILDPLATFORM keeps the Go compile native while buildx targets arm64.
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
+# Images are pinned by digest; Dependabot and Renovate move the digest when the tag moves.
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS builder
 
 WORKDIR /app
 
@@ -21,17 +22,18 @@ ARG TARGETARCH=amd64
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -a -installsuffix cgo \
     -ldflags="-s -w" -o server ./cmd/server
 
-# Final stage (use 3.23 for CI image availability; 3.24 when zlib 1.3.2+ is needed)
-FROM alpine:3.24.1
+# Final stage
+FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
-# Create a non-root user to run the server
-RUN addgroup -S snorlx && adduser -S -G snorlx snorlx
+# Create a non-root user with a fixed numeric uid so Kubernetes runAsNonRoot can verify it
+RUN addgroup -S -g 1000 snorlx && adduser -S -u 1000 -G snorlx snorlx
 
 WORKDIR /app
 
-# Install ca-certificates for HTTPS; upgrade openssl packages for libssl3 CVEs
+# ca-certificates for HTTPS to GitHub, wget for the health check, then pull every
+# package fix published since the base image was built (not only the OpenSSL ones).
 RUN apk --no-cache add ca-certificates wget \
-    && apk --no-cache upgrade libssl3 libcrypto3 openssl
+    && apk --no-cache upgrade
 
 # Copy binary from builder
 COPY --from=builder /app/server .
@@ -39,7 +41,7 @@ COPY --from=builder /app/server .
 # Transfer ownership to the non-root user
 RUN chown snorlx:snorlx /app/server
 
-USER snorlx
+USER 1000:1000
 
 # Expose port
 EXPOSE 8080

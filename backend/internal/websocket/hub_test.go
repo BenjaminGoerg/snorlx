@@ -8,6 +8,34 @@ import (
 	"time"
 )
 
+func newTestClient(id string, userID int, hub *Hub) *Client {
+	return &Client{ID: id, UserID: userID, hub: hub, send: make(chan []byte, 10)}
+}
+
+func receive(t *testing.T, c *Client) Message {
+	t.Helper()
+	select {
+	case data := <-c.send:
+		var msg Message
+		if err := json.Unmarshal(data, &msg); err != nil {
+			t.Fatalf("failed to unmarshal message: %v", err)
+		}
+		return msg
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected message to be received within 200ms")
+		return Message{}
+	}
+}
+
+func expectSilence(t *testing.T, c *Client) {
+	t.Helper()
+	select {
+	case data := <-c.send:
+		t.Fatalf("expected no message, got %s", data)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 // ===== Hub Creation =====
 
 func TestNewHub_CreatesEmptyHub(t *testing.T) {
@@ -25,231 +53,183 @@ func TestNewHub_CreatesEmptyHub(t *testing.T) {
 func TestRegisterAndUnregister(t *testing.T) {
 	hub := NewHub()
 	go hub.Run()
-
-	// Give the hub goroutine time to start
 	time.Sleep(10 * time.Millisecond)
 
-	client := &Client{
-		ID:   "test-client",
-		hub:  hub,
-		send: make(chan []byte, 10),
-	}
+	client := newTestClient("test-client", 1, hub)
 
 	hub.Register(client)
-	// Wait for registration to be processed
 	time.Sleep(10 * time.Millisecond)
-
 	if hub.ClientCount() != 1 {
 		t.Errorf("expected 1 client after register, got %d", hub.ClientCount())
 	}
 
 	hub.Unregister(client)
-	// Wait for unregistration to be processed
 	time.Sleep(10 * time.Millisecond)
-
 	if hub.ClientCount() != 0 {
 		t.Errorf("expected 0 clients after unregister, got %d", hub.ClientCount())
 	}
 }
 
-// ===== Broadcast =====
+// ===== Targeted delivery =====
 
-func TestBroadcast_DeliversToClient(t *testing.T) {
+func TestSendToUsers_DeliversOnlyToRecipients(t *testing.T) {
 	hub := NewHub()
 	go hub.Run()
 	time.Sleep(10 * time.Millisecond)
 
-	client := &Client{
-		ID:   "receiver",
-		hub:  hub,
-		send: make(chan []byte, 10),
+	alice := newTestClient("alice", 1, hub)
+	bob := newTestClient("bob", 2, hub)
+	hub.Register(alice)
+	hub.Register(bob)
+	time.Sleep(10 * time.Millisecond)
+
+	hub.SendToUsers([]int{1}, Message{Type: "test", Data: "hello"})
+
+	if got := receive(t, alice); got.Type != "test" {
+		t.Errorf("expected type 'test', got %q", got.Type)
 	}
+	expectSilence(t, bob)
+
+	hub.Unregister(alice)
+	hub.Unregister(bob)
+}
+
+func TestSendToUsers_EmptyRecipients_NoDelivery(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+	time.Sleep(10 * time.Millisecond)
+
+	client := newTestClient("c", 1, hub)
 	hub.Register(client)
 	time.Sleep(10 * time.Millisecond)
 
-	msg := Message{Type: "test", Data: "hello"}
-	hub.Broadcast(msg)
+	hub.SendToUsers(nil, Message{Type: "test"})
+	expectSilence(t, client)
+
+	hub.Unregister(client)
+}
+
+func TestSendWorkflowRunUpdate_SendsCorrectType(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
 	time.Sleep(10 * time.Millisecond)
 
-	select {
-	case data := <-client.send:
-		var received Message
-		if err := json.Unmarshal(data, &received); err != nil {
-			t.Fatalf("failed to unmarshal message: %v", err)
-		}
-		if received.Type != "test" {
-			t.Errorf("expected type 'test', got %q", received.Type)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("expected message to be received within 100ms")
+	client := newTestClient("wf-receiver", 7, hub)
+	hub.Register(client)
+	time.Sleep(10 * time.Millisecond)
+
+	hub.SendWorkflowRunUpdate([]int{7}, map[string]string{"id": "123"})
+
+	if got := receive(t, client); got.Type != "workflow_run" {
+		t.Errorf("expected type 'workflow_run', got %q", got.Type)
 	}
 
 	hub.Unregister(client)
 }
 
-// ===== Broadcast helpers =====
-
-func TestBroadcastWorkflowRunUpdate_SendsCorrectType(t *testing.T) {
+func TestSendSyncEvents_OnlyToInitiator(t *testing.T) {
 	hub := NewHub()
 	go hub.Run()
 	time.Sleep(10 * time.Millisecond)
 
-	client := &Client{
-		ID:   "wf-receiver",
-		hub:  hub,
-		send: make(chan []byte, 10),
-	}
-	hub.Register(client)
+	initiator := newTestClient("initiator", 1, hub)
+	other := newTestClient("other", 2, hub)
+	hub.Register(initiator)
+	hub.Register(other)
 	time.Sleep(10 * time.Millisecond)
 
-	hub.BroadcastWorkflowRunUpdate(map[string]string{"id": "123"})
-	time.Sleep(10 * time.Millisecond)
+	hub.SendSyncStart(1, 10)
+	if got := receive(t, initiator); got.Type != "sync:start" {
+		t.Errorf("expected sync:start, got %q", got.Type)
+	}
+	expectSilence(t, other)
 
-	select {
-	case data := <-client.send:
-		var msg Message
-		json.Unmarshal(data, &msg)
-		if msg.Type != "workflow_run" {
-			t.Errorf("expected type 'workflow_run', got %q", msg.Type)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("expected message to be delivered")
+	hub.SendSyncComplete(1, 5, 20, 100)
+	if got := receive(t, initiator); got.Type != "sync:complete" {
+		t.Errorf("expected sync:complete, got %q", got.Type)
 	}
 
-	hub.Unregister(client)
+	hub.SendSyncError(1, "something went wrong")
+	if got := receive(t, initiator); got.Type != "sync:error" {
+		t.Errorf("expected sync:error, got %q", got.Type)
+	}
+
+	hub.Unregister(initiator)
+	hub.Unregister(other)
 }
 
-func TestBroadcastSyncStart_SendsCorrectType(t *testing.T) {
+func TestSendSyncProgress_ComputesPercentage(t *testing.T) {
 	hub := NewHub()
 	go hub.Run()
 	time.Sleep(10 * time.Millisecond)
 
-	client := &Client{
-		ID:   "sync-receiver",
-		hub:  hub,
-		send: make(chan []byte, 10),
-	}
+	client := newTestClient("progress-receiver", 1, hub)
 	hub.Register(client)
 	time.Sleep(10 * time.Millisecond)
 
-	hub.BroadcastSyncStart(10)
-	time.Sleep(10 * time.Millisecond)
-
-	select {
-	case data := <-client.send:
-		var msg Message
-		json.Unmarshal(data, &msg)
-		if msg.Type != "sync:start" {
-			t.Errorf("expected type 'sync:start', got %q", msg.Type)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("expected sync:start message to be delivered")
-	}
-
-	hub.Unregister(client)
-}
-
-func TestBroadcastSyncProgress_ComputesPercentage(t *testing.T) {
-	hub := NewHub()
-	go hub.Run()
-	time.Sleep(10 * time.Millisecond)
-
-	client := &Client{
-		ID:   "progress-receiver",
-		hub:  hub,
-		send: make(chan []byte, 10),
-	}
-	hub.Register(client)
-	time.Sleep(10 * time.Millisecond)
-
-	hub.BroadcastSyncProgress(5, 10, "my-repo")
-	time.Sleep(10 * time.Millisecond)
+	hub.SendSyncProgress(1, 5, 10, "my-repo")
 
 	select {
 	case data := <-client.send:
 		var msg struct {
 			Type string `json:"type"`
 			Data struct {
-				Synced   float64 `json:"synced"`
-				Total    float64 `json:"total"`
 				Progress float64 `json:"progress"`
-				Current  string  `json:"current"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
 			t.Fatalf("failed to unmarshal: %v", err)
 		}
-		if msg.Type != "sync:progress" {
-			t.Errorf("expected type 'sync:progress', got %q", msg.Type)
+		if msg.Type != "sync:progress" || msg.Data.Progress != 50 {
+			t.Errorf("unexpected message %s", data)
 		}
-		if msg.Data.Progress != 50 {
-			t.Errorf("expected progress 50%%, got %v", msg.Data.Progress)
-		}
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(200 * time.Millisecond):
 		t.Error("expected sync:progress message to be delivered")
 	}
 
-	hub.Unregister(client)
-}
-
-func TestBroadcastSyncComplete_SendsCorrectType(t *testing.T) {
-	hub := NewHub()
-	go hub.Run()
-	time.Sleep(10 * time.Millisecond)
-
-	client := &Client{
-		ID:   "complete-receiver",
-		hub:  hub,
-		send: make(chan []byte, 10),
-	}
-	hub.Register(client)
-	time.Sleep(10 * time.Millisecond)
-
-	hub.BroadcastSyncComplete(5, 20, 100)
-	time.Sleep(10 * time.Millisecond)
-
+	// Zero total must not divide by zero
+	hub.SendSyncProgress(1, 0, 0, "")
 	select {
 	case data := <-client.send:
-		var msg Message
-		json.Unmarshal(data, &msg)
-		if msg.Type != "sync:complete" {
-			t.Errorf("expected type 'sync:complete', got %q", msg.Type)
+		var msg struct {
+			Data struct {
+				Progress float64 `json:"progress"`
+			} `json:"data"`
 		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("expected sync:complete message to be delivered")
+		_ = json.Unmarshal(data, &msg)
+		if msg.Data.Progress != 0 {
+			t.Errorf("expected 0%% progress for zero total, got %v", msg.Data.Progress)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Error("expected message to be delivered")
 	}
 
 	hub.Unregister(client)
 }
 
-func TestBroadcastSyncError_SendsCorrectType(t *testing.T) {
+func TestDeliver_SlowClientIsDisconnected(t *testing.T) {
 	hub := NewHub()
 	go hub.Run()
 	time.Sleep(10 * time.Millisecond)
 
-	client := &Client{
-		ID:   "error-receiver",
-		hub:  hub,
-		send: make(chan []byte, 10),
-	}
-	hub.Register(client)
+	slow := &Client{ID: "slow", UserID: 1, hub: hub, send: make(chan []byte)} // unbuffered, nobody reads
+	fast := newTestClient("fast", 1, hub)
+	hub.Register(slow)
+	hub.Register(fast)
 	time.Sleep(10 * time.Millisecond)
 
-	hub.BroadcastSyncError("something went wrong")
+	hub.SendToUser(1, Message{Type: "test"})
+	receive(t, fast)
 	time.Sleep(10 * time.Millisecond)
 
-	select {
-	case data := <-client.send:
-		var msg Message
-		json.Unmarshal(data, &msg)
-		if msg.Type != "sync:error" {
-			t.Errorf("expected type 'sync:error', got %q", msg.Type)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("expected sync:error message to be delivered")
+	if hub.ClientCount() != 1 {
+		t.Errorf("expected slow client to be removed, got %d clients", hub.ClientCount())
+	}
+	if _, open := <-slow.send; open {
+		t.Error("expected slow client channel to be closed")
 	}
 
-	hub.Unregister(client)
+	hub.Unregister(fast)
 }
 
 // ===== GetUpgraderWithOrigin =====
@@ -276,14 +256,14 @@ func TestGetUpgraderWithOrigin_BlocksDifferentOrigin(t *testing.T) {
 	}
 }
 
-func TestGetUpgraderWithOrigin_EmptyAllowsAll(t *testing.T) {
+func TestGetUpgraderWithOrigin_EmptyDeniesAll(t *testing.T) {
 	upgrader := GetUpgraderWithOrigin("")
 
 	req := httptest.NewRequest(http.MethodGet, "/ws", nil)
 	req.Header.Set("Origin", "https://any-origin.com")
 
-	if !upgrader.CheckOrigin(req) {
-		t.Error("expected any origin when allowed origin is empty")
+	if upgrader.CheckOrigin(req) {
+		t.Error("expected every origin to be denied when no origin is configured")
 	}
 }
 
@@ -296,11 +276,7 @@ func TestClientCount_MultipleClients(t *testing.T) {
 
 	clients := make([]*Client, 3)
 	for i := range clients {
-		clients[i] = &Client{
-			ID:   "client-" + string(rune('A'+i)),
-			hub:  hub,
-			send: make(chan []byte, 10),
-		}
+		clients[i] = newTestClient("client-"+string(rune('A'+i)), i+1, hub)
 		hub.Register(clients[i])
 	}
 	time.Sleep(20 * time.Millisecond)
@@ -317,42 +293,4 @@ func TestClientCount_MultipleClients(t *testing.T) {
 	if hub.ClientCount() != 0 {
 		t.Errorf("expected 0 clients after all unregistered, got %d", hub.ClientCount())
 	}
-}
-
-// ===== BroadcastSyncProgress edge cases =====
-
-func TestBroadcastSyncProgress_ZeroTotal(t *testing.T) {
-	hub := NewHub()
-	go hub.Run()
-	time.Sleep(10 * time.Millisecond)
-
-	client := &Client{
-		ID:   "zero-total-receiver",
-		hub:  hub,
-		send: make(chan []byte, 10),
-	}
-	hub.Register(client)
-	time.Sleep(10 * time.Millisecond)
-
-	// Zero total should not cause a divide-by-zero
-	hub.BroadcastSyncProgress(0, 0, "")
-	time.Sleep(10 * time.Millisecond)
-
-	select {
-	case data := <-client.send:
-		var msg struct {
-			Type string `json:"type"`
-			Data struct {
-				Progress float64 `json:"progress"`
-			} `json:"data"`
-		}
-		json.Unmarshal(data, &msg)
-		if msg.Data.Progress != 0 {
-			t.Errorf("expected 0%% progress for zero total, got %v", msg.Data.Progress)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("expected message to be delivered")
-	}
-
-	hub.Unregister(client)
 }
