@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -31,24 +33,24 @@ func isRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
-	
+
 	// Check for GitHub API error responses
 	var ghErr *github.ErrorResponse
 	if errors.As(err, &ghErr) {
 		switch ghErr.Response.StatusCode {
-		case http.StatusBadGateway,      // 502
+		case http.StatusBadGateway, // 502
 			http.StatusServiceUnavailable, // 503
 			http.StatusGatewayTimeout,     // 504
 			http.StatusTooManyRequests:    // 429
 			return true
 		}
 	}
-	
+
 	// Check for context errors (not retryable)
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	
+
 	// Check error message for common transient issues
 	errStr := err.Error()
 	return strings.Contains(errStr, "502") ||
@@ -62,23 +64,23 @@ func isRetryableError(err error) bool {
 func retryWithBackoff[T any](ctx context.Context, operation string, fn func() (T, error)) (T, error) {
 	var result T
 	var lastErr error
-	
+
 	delay := retryDelay
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		// Check if context is cancelled
 		if ctx.Err() != nil {
 			return result, ctx.Err()
 		}
-		
+
 		result, lastErr = fn()
 		if lastErr == nil {
 			return result, nil
 		}
-		
+
 		if !isRetryableError(lastErr) {
 			return result, lastErr
 		}
-		
+
 		if attempt < maxRetries-1 {
 			log.Warn().
 				Err(lastErr).
@@ -86,13 +88,13 @@ func retryWithBackoff[T any](ctx context.Context, operation string, fn func() (T
 				Int("attempt", attempt+1).
 				Dur("retry_in", delay).
 				Msg("Retrying after transient error")
-			
+
 			select {
 			case <-ctx.Done():
 				return result, ctx.Err()
 			case <-time.After(delay):
 			}
-			
+
 			// Exponential backoff
 			delay *= 2
 			if delay > maxRetryDelay {
@@ -100,28 +102,88 @@ func retryWithBackoff[T any](ctx context.Context, operation string, fn func() (T
 			}
 		}
 	}
-	
+
 	return result, lastErr
+}
+
+// enterpriseURLs are the GitHub Enterprise Server endpoints derived from GITHUB_BASE_URL.
+// origin is scheme://host[:port] with no path, so go-github can append /api/v3 and /api/uploads.
+type enterpriseURLs struct {
+	oauth  oauth2.Endpoint
+	origin string
 }
 
 // Client wraps the GitHub API client using OAuth App authentication
 type Client struct {
 	config      *config.Config
 	oauthConfig *oauth2.Config
+	enterprise  *enterpriseURLs
 }
 
 // NewClient creates a new GitHub OAuth client
 func NewClient(cfg *config.Config) (*Client, error) {
+	endpoint := ghOAuth.Endpoint
+	var enterprise *enterpriseURLs
+	if raw := strings.TrimSpace(cfg.GitHubBaseURL); raw != "" {
+		resolved, err := resolveEnterpriseBaseURL(raw)
+		if err != nil {
+			return nil, err
+		}
+		endpoint = resolved.oauth
+		enterprise = &resolved
+	}
+
 	oauthConfig := &oauth2.Config{
 		ClientID:     cfg.GitHubClientID,
 		ClientSecret: cfg.GitHubClientSecret,
 		Scopes:       []string{"read:user", "user:email", "repo", "read:org"},
-		Endpoint:     ghOAuth.Endpoint,
+		Endpoint:     endpoint,
 	}
 
 	return &Client{
 		config:      cfg,
 		oauthConfig: oauthConfig,
+		enterprise:  enterprise,
+	}, nil
+}
+
+// resolveEnterpriseBaseURL accepts the Enterprise Server origin
+// (https://hostname) or the REST prefix (https://hostname/api/v3).
+// OAuth stays on the origin. The API client also receives only the origin:
+// passing a URL that already ends in /api/v3 as the upload URL makes
+// go-github append another api/uploads segment.
+func resolveEnterpriseBaseURL(raw string) (enterpriseURLs, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return enterpriseURLs{}, fmt.Errorf("invalid GITHUB_BASE_URL: %q is not an absolute URL", raw)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return enterpriseURLs{}, fmt.Errorf("invalid GITHUB_BASE_URL: scheme must be http or https")
+	}
+	if u.User != nil {
+		return enterpriseURLs{}, fmt.Errorf("invalid GITHUB_BASE_URL: must not include user info")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return enterpriseURLs{}, fmt.Errorf("invalid GITHUB_BASE_URL: must not include a query or fragment")
+	}
+
+	host := u.Hostname()
+	if strings.HasPrefix(host, "api.") || strings.Contains(host, ".api.") || strings.HasPrefix(host, "uploads.") {
+		return enterpriseURLs{}, fmt.Errorf("invalid GITHUB_BASE_URL: set the Enterprise Server hostname, not the API host")
+	}
+
+	path := strings.TrimSuffix(u.EscapedPath(), "/")
+	if path != "" && path != "/api/v3" {
+		return enterpriseURLs{}, fmt.Errorf("invalid GITHUB_BASE_URL: use https://hostname or https://hostname/api/v3")
+	}
+
+	origin := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
+	return enterpriseURLs{
+		oauth: oauth2.Endpoint{
+			AuthURL:  origin + "/login/oauth/authorize",
+			TokenURL: origin + "/login/oauth/access_token",
+		},
+		origin: origin,
 	}, nil
 }
 
@@ -139,7 +201,13 @@ func (c *Client) ExchangeCode(ctx context.Context, code string) (*oauth2.Token, 
 func (c *Client) GetUserClient(ctx context.Context, token *oauth2.Token) *github.Client {
 	ts := c.oauthConfig.TokenSource(ctx, token)
 	tc := oauth2.NewClient(ctx, ts)
-	client, err := github.NewClient(github.WithHTTPClient(tc))
+
+	opts := []github.ClientOptionsFunc{github.WithHTTPClient(tc)}
+	if c.enterprise != nil {
+		opts = append(opts, github.WithEnterpriseURLs(c.enterprise.origin, c.enterprise.origin))
+	}
+
+	client, err := github.NewClient(opts...)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to create GitHub API client")
 		return nil
@@ -273,12 +341,12 @@ func (c *Client) ListWorkflows(ctx context.Context, client *github.Client, owner
 			workflows *github.Workflows
 			resp      *github.Response
 		}
-		
+
 		result, err := retryWithBackoff(ctx, "ListWorkflows:"+owner+"/"+repo, func() (listResult, error) {
 			workflows, resp, err := client.Actions.ListWorkflows(ctx, owner, repo, opts)
 			return listResult{workflows, resp}, err
 		})
-		
+
 		if err != nil {
 			return allWorkflows, err // Return what we have so far
 		}
@@ -301,12 +369,12 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, client *github.Client, ow
 	if opts == nil {
 		opts = &github.ListWorkflowRunsOptions{}
 	}
-	
+
 	// Default limit
 	if maxRuns <= 0 {
 		maxRuns = 500
 	}
-	
+
 	// Optimize page size based on maxRuns
 	perPage := 100
 	if maxRuns < 100 {
@@ -319,12 +387,12 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, client *github.Client, ow
 			runs *github.WorkflowRuns
 			resp *github.Response
 		}
-		
+
 		result, err := retryWithBackoff(ctx, "ListWorkflowRuns:"+owner+"/"+repo, func() (listResult, error) {
 			runs, resp, err := client.Actions.ListRepositoryWorkflowRuns(ctx, owner, repo, opts)
 			return listResult{runs, resp}, err
 		})
-		
+
 		if err != nil {
 			return allRuns, err // Return what we have so far on error
 		}
@@ -433,13 +501,13 @@ func (c *Client) GetWorkflowRunAnnotations(ctx context.Context, client *github.C
 		opts := &github.ListCheckRunsOptions{
 			ListOptions: github.ListOptions{PerPage: 100},
 		}
-		
+
 		checkRuns, _, err := client.Checks.ListCheckRunsForRef(ctx, owner, repo, headSHA, opts)
 		if err != nil {
 			log.Warn().Err(err).Str("sha", headSHA).Msg("Failed to list check runs for ref")
 		} else {
 			log.Debug().Int("check_runs_count", len(checkRuns.CheckRuns)).Msg("Found check runs")
-			
+
 			for _, checkRun := range checkRuns.CheckRuns {
 				if checkRun.ID == nil {
 					continue
@@ -507,7 +575,7 @@ func (c *Client) GetWorkflowRunAnnotations(ctx context.Context, client *github.C
 	// If still no annotations and the run failed, try to get job-level errors
 	if len(annotations) == 0 && run.GetConclusion() == "failure" {
 		log.Debug().Msg("No annotations found, checking for job-level errors")
-		
+
 		// Try to get jobs for this run - they might have error info
 		jobs, _, err := client.Actions.ListWorkflowJobs(ctx, owner, repo, runID, &github.ListWorkflowJobsOptions{
 			ListOptions: github.ListOptions{PerPage: 100},
@@ -528,7 +596,7 @@ func (c *Client) GetWorkflowRunAnnotations(ctx context.Context, client *github.C
 				}
 			}
 		}
-		
+
 		// Try to get check suite info if still no annotations
 		if len(annotations) == 0 && run.CheckSuiteID != nil && *run.CheckSuiteID != 0 {
 			checkSuite, _, err := client.Checks.GetCheckSuite(ctx, owner, repo, *run.CheckSuiteID)
@@ -557,12 +625,12 @@ func (c *Client) GetWorkflowContent(ctx context.Context, client *github.Client, 
 	if fileContent == nil {
 		return nil, errors.New("workflow file not found")
 	}
-	
+
 	content, err := fileContent.GetContent()
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return []byte(content), nil
 }
 

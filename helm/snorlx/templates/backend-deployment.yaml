@@ -61,6 +61,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "snorlx.fullname" . }}-secrets
                   key: github-client-secret
+            - name: GITHUB_BASE_URL
+              value: {{ .Values.github.baseUrl | quote }}
             - name: GITHUB_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:

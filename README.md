@@ -266,7 +266,7 @@ This project uses GitHub OAuth App for user authentication (simpler than GitHub 
 
 ### Step 1: Create OAuth App
 
-1. Go to [GitHub Developer Settings](https://github.com/settings/developers)
+1. Go to [GitHub Developer Settings](https://github.com/settings/developers). On GitHub Enterprise Server, open `https://<your-ghe-host>/settings/developers` on that instance instead.
 2. Click **OAuth Apps** → **New OAuth App**
 3. Fill in the details:
 
@@ -288,6 +288,8 @@ Add to your `.env` file:
 ```bash
 GITHUB_CLIENT_ID=your_client_id_here
 GITHUB_CLIENT_SECRET=your_client_secret_here
+# Only for GitHub Enterprise Server. Hostname, or the same host with /api/v3.
+# GITHUB_BASE_URL=https://github.mycompany.com
 ```
 
 ### OAuth Scopes
@@ -333,12 +335,13 @@ For real-time updates via webhooks, configure a webhook in your repository/organ
 
 #### GitHub OAuth Configuration
 
-| Variable                | Description                    | Required               |
-| ----------------------- | ------------------------------ | ---------------------- |
-| `GITHUB_CLIENT_ID`      | GitHub OAuth App Client ID     | Yes                    |
-| `GITHUB_CLIENT_SECRET`  | GitHub OAuth App Client Secret | Yes                    |
-| `GITHUB_WEBHOOK_SECRET` | Webhook signature secret       | No (for webhooks only) |
-| `DEV_MODE`              | Skip GitHub OAuth validation   | No                     |
+| Variable                | Description                                              | Required                    |
+| ----------------------- | -------------------------------------------------------- | --------------------------- |
+| `GITHUB_CLIENT_ID`      | GitHub OAuth App Client ID                               | Yes                         |
+| `GITHUB_CLIENT_SECRET`  | GitHub OAuth App Client Secret                           | Yes                         |
+| `GITHUB_BASE_URL`       | Enterprise Server URL (`https://host` or `.../api/v3`)   | No (defaults to github.com) |
+| `GITHUB_WEBHOOK_SECRET` | Webhook signature secret                                 | No (for webhooks only)      |
+| `DEV_MODE`              | Skip GitHub OAuth validation                             | No                          |
 
 #### Sync Configuration
 

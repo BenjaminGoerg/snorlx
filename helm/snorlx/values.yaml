@@ -82,6 +82,8 @@ github:
   clientSecret: ""
   privateKey: ""
   webhookSecret: ""
+  # GitHub Enterprise Server hostname. Leave empty for github.com.
+  baseUrl: ""
 
 # Session configuration
 session:
